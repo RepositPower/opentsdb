@@ -22,6 +22,8 @@ import java.util.List;
 import java.util.Map;
 
 import net.opentsdb.core.TSDB;
+import net.opentsdb.uid.NoSuchUniqueId;
+import net.opentsdb.uid.NoSuchUniqueName;
 import net.opentsdb.uid.UniqueId;
 import net.opentsdb.uid.UniqueId.UniqueIdType;
 import net.opentsdb.utils.JSON;
@@ -70,14 +72,14 @@ import com.stumbleupon.async.Deferred;
 @JsonIgnoreProperties(ignoreUnknown = true)
 @JsonInclude(Include.NON_NULL)
 @JsonAutoDetect(fieldVisibility = Visibility.PUBLIC_ONLY)
-public final class TSMeta {
+public class TSMeta {
   private static final Logger LOG = LoggerFactory.getLogger(TSMeta.class);
 
   /** Charset used to convert Strings to byte arrays and back. */
   private static final Charset CHARSET = Charset.forName("ISO-8859-1");
   
   /** The single column family used by this class. */
-  private static final byte[] FAMILY = "name".getBytes(CHARSET);
+  public static final byte[] FAMILY = "name".getBytes(CHARSET);
   
   /** The cell qualifier to use for timeseries meta */
   private static final byte[] META_QUALIFIER = "ts_meta".getBytes(CHARSET);
@@ -251,8 +253,7 @@ public final class TSMeta {
     }
     
     // parse out the tags from the tsuid
-    final List<byte[]> parsed_tags = UniqueId.getTagPairsFromTSUID(tsuid, 
-        TSDB.metrics_width(), TSDB.tagk_width(), TSDB.tagv_width());
+    final List<byte[]> parsed_tags = UniqueId.getTagsFromTSUID(tsuid);
     
     // Deferred group used to accumulate UidCB callbacks so the next call
     // can wait until all of the UIDs have been verified
@@ -339,15 +340,14 @@ public final class TSMeta {
   }
   
   /**
-   * Attempts to store a new, blank timeseries meta object via a CompareAndSet
+   * Attempts to store a new, blank timeseries meta object
    * <b>Note:</b> This should not be called by user accessible methods as it will 
    * overwrite any data already in the column.
    * <b>Note:</b> This call does not guarantee that the UIDs exist before
    * storing as it should only be called *after* a data point has been recorded
    * or during a meta sync. 
    * @param tsdb The TSDB to use for storage access
-   * @return True if the CAS completed successfully (and no TSMeta existed 
-   * previously), false if something was already stored in the TSMeta column.
+   * @return True if the TSMeta created(or updated) successfully
    * @throws HBaseException if there was an issue fetching
    * @throws IllegalArgumentException if parsing failed
    * @throws JSONException if the object could not be serialized
@@ -406,24 +406,21 @@ public final class TSMeta {
     if (column.value() == null || column.value().length < 1) {
       throw new IllegalArgumentException("Empty column value");
     }
-    
-    final TSMeta meta = JSON.parseToObject(column.value(), TSMeta.class);
+
+    final TSMeta parsed_meta = JSON.parseToObject(column.value(), TSMeta.class);
     
     // fix in case the tsuid is missing
-    if (meta.tsuid == null || meta.tsuid.isEmpty()) {
-      meta.tsuid = UniqueId.uidToString(column.key());
+    if (parsed_meta.tsuid == null || parsed_meta.tsuid.isEmpty()) {
+      parsed_meta.tsuid = UniqueId.uidToString(column.key());
     }
+
+    Deferred<TSMeta> meta = getFromStorage(tsdb, UniqueId.stringToUid(parsed_meta.tsuid));
     
     if (!load_uidmetas) {
-      return Deferred.fromResult(meta);
+      return meta;
     }
     
-    final LoadUIDs deferred = new LoadUIDs(tsdb, meta.tsuid);
-    try {
-      return deferred.call(meta);
-    } catch (Exception e) {
-      throw new RuntimeException(e);
-    }
+    return meta.addCallbackDeferring(new LoadUIDs(tsdb, parsed_meta.tsuid));
   }
   
   /**
@@ -529,7 +526,7 @@ public final class TSMeta {
       @Override
       public Deferred<Long> call(final Long incremented_value) 
         throws Exception {
-        
+        LOG.debug("Value: " + incremented_value);
         if (incremented_value > 1) {
           // TODO - maybe update the search index every X number of increments?
           // Otherwise the search engine would only get last_updated/count 
@@ -592,10 +589,8 @@ public final class TSMeta {
             }
             
             LOG.info("Successfullly created new TSUID entry for: " + meta);
-            final Deferred<TSMeta> meta = getFromStorage(tsdb, tsuid)
-              .addCallbackDeferring(
-                new LoadUIDs(tsdb, UniqueId.uidToString(tsuid)));
-            return meta.addCallbackDeferring(new FetchNewCB());
+            return new LoadUIDs(tsdb, UniqueId.uidToString(tsuid)).call(meta)
+                    .addCallbackDeferring(new FetchNewCB());
           }
           
         }
@@ -612,10 +607,78 @@ public final class TSMeta {
     // if the user has disabled real time TSMeta tracking (due to OOM issues)
     // then we only want to increment the data point count.
     if (!tsdb.getConfig().enable_realtime_ts()) {
-      return tsdb.getClient().bufferAtomicIncrement(inc);
+      return tsdb.getClient().atomicIncrement(inc);
     }
-    return tsdb.getClient().bufferAtomicIncrement(inc).addCallbackDeferring(
+    return tsdb.getClient().atomicIncrement(inc).addCallbackDeferring(
         new TSMetaCB());
+  }
+
+  /**
+   * Attempts to fetch the meta column and if null, attempts to write a new 
+   * column using {@link #storeNew}.
+   * @param tsdb The TSDB instance to use for access.
+   * @param tsuid The TSUID of the time series.
+   * @return A deferred with a true if the meta exists or was created, false
+   * if the meta did not exist and writing failed.
+   */
+  public static Deferred<Boolean> storeIfNecessary(final TSDB tsdb, 
+      final byte[] tsuid) {
+    final GetRequest get = new GetRequest(tsdb.metaTable(), tsuid);
+    get.family(FAMILY);
+    get.qualifier(META_QUALIFIER);
+
+    final class CreateNewCB implements Callback<Deferred<Boolean>, Object> {
+
+      @Override
+      public Deferred<Boolean> call(Object arg0) throws Exception {
+        final TSMeta meta = new TSMeta(tsuid, System.currentTimeMillis() / 1000);
+
+        final class FetchNewCB implements Callback<Deferred<Boolean>, TSMeta> {
+
+          @Override
+          public Deferred<Boolean> call(TSMeta stored_meta) throws Exception {
+
+            // pass to the search plugin
+            tsdb.indexTSMeta(stored_meta);
+
+            // pass through the trees
+            tsdb.processTSMetaThroughTrees(stored_meta);
+
+            return Deferred.fromResult(true);
+          }
+        }
+
+        final class StoreNewCB implements Callback<Deferred<Boolean>, Boolean> {
+
+          @Override
+          public Deferred<Boolean> call(Boolean success) throws Exception {
+            if (!success) {
+              LOG.warn("Unable to save metadata: " + meta);
+              return Deferred.fromResult(false);
+            }
+
+            LOG.info("Successfullly created new TSUID entry for: " + meta);
+            return new LoadUIDs(tsdb, UniqueId.uidToString(tsuid)).call(meta)
+                    .addCallbackDeferring(new FetchNewCB());
+          }
+        }
+
+        return meta.storeNew(tsdb).addCallbackDeferring(new StoreNewCB());
+      }
+    }
+
+    final class ExistsCB implements Callback<Deferred<Boolean>, ArrayList<KeyValue>> {
+
+      @Override
+      public Deferred<Boolean> call(ArrayList<KeyValue> row) throws Exception {
+        if (row == null || row.isEmpty() || row.get(0).value() == null) {
+          return new CreateNewCB().call(null);
+        }
+        return Deferred.fromResult(true);
+      }
+    }
+
+    return tsdb.getClient().get(get).addCallbackDeferring(new ExistsCB());
   }
   
   /**
@@ -840,8 +903,7 @@ public final class TSMeta {
       }
       
       // split up the tags
-      final List<byte[]> tags = UniqueId.getTagPairsFromTSUID(tsuid, 
-          TSDB.metrics_width(), TSDB.tagk_width(), TSDB.tagv_width());
+      final List<byte[]> tags = UniqueId.getTagsFromTSUID(tsuid);
       meta.tags = new ArrayList<UIDMeta>(tags.size());
       
       // initialize with empty objects, otherwise the "set" operations in 
@@ -1034,6 +1096,11 @@ public final class TSMeta {
       changed.put("created", true);
       this.created = created;
     }
+  }
+  
+  /** @param tsuid The TSUID of the timeseries. */
+  public final void setTSUID(final String tsuid) {
+    this.tsuid = tsuid;
   }
   
   /** @param custom optional key/value map */

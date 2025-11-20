@@ -12,20 +12,28 @@
 // see <http://www.gnu.org/licenses/>.
 package net.opentsdb.core;
 
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
+
+import net.opentsdb.uid.UniqueId;
 
 import org.hbase.async.Bytes;
 import org.hbase.async.KeyValue;
 import org.hbase.async.Scanner;
 
+import com.stumbleupon.async.Callback;
+
 /**
  * <strong>This class is not part of the public API.</strong>
- * <p><pre>
- * ,____________________________,
+ */
+
+/**-
+ *  ,____________________________,
  * | This class is reserved for |
  * | OpenTSDB's internal usage! |
  * `----------------------------'
@@ -46,8 +54,10 @@ import org.hbase.async.Scanner;
  *                ///-._ _ _ _ _ _ _}^ - - - - ~                     ~-- ,.-~
  *                                                                   /.-~
  *              You've been warned by the dragon!
- * </pre><p>
- * This class is reserved for OpenTSDB's own internal usage only.  If you use
+ * 
+ */
+
+/** This class is reserved for OpenTSDB's own internal usage only.  If you use
  * anything from this package outside of OpenTSDB, a dragon will spontaneously
  * appear and eat you.  You've been warned.
  * <p>
@@ -80,6 +90,22 @@ public final class Internal {
     return ((TsdbQuery) query).getScanner();
   }
 
+  /** Returns a set of scanners, one for each bucket if salted, or one scanner
+   * if salting is disabled. 
+   * @see TsdbQuery#getScanner() */
+  public static List<Scanner> getScanners(final Query query) {
+    final List<Scanner> scanners = new ArrayList<Scanner>(
+        Const.SALT_WIDTH() > 0 ? Const.SALT_BUCKETS() : 1);
+    if (Const.SALT_WIDTH() > 0) {
+      for (int i = 0; i < Const.SALT_BUCKETS(); i++) {
+        scanners.add(((TsdbQuery) query).getScanner(i));
+      }
+    } else {
+      scanners.add(((TsdbQuery) query).getScanner());
+    }
+    return scanners;
+  }
+  
   /** @see RowKey#metricName */
   public static String metricName(final TSDB tsdb, final byte[] id) {
     return RowKey.metricName(tsdb, id);
@@ -87,9 +113,41 @@ public final class Internal {
 
   /** Extracts the timestamp from a row key.  */
   public static long baseTime(final TSDB tsdb, final byte[] row) {
-    return Bytes.getUnsignedInt(row, tsdb.metrics.width());
+    return Bytes.getUnsignedInt(row, Const.SALT_WIDTH() + TSDB.metrics_width());
   }
-
+  
+  /** @return the time normalized to an hour boundary in epoch seconds */
+  public static long baseTime(final long timestamp) {
+    if ((timestamp & Const.SECOND_MASK) != 0) {
+      // drop the ms timestamp to seconds to calculate the base timestamp
+      return ((timestamp / 1000) - 
+          ((timestamp / 1000) % Const.MAX_TIMESPAN));
+    } else {
+      return (timestamp - (timestamp % Const.MAX_TIMESPAN));
+    }
+  }
+  
+  /**
+   * Extracts the timestamp from a row key.
+   * @param row The row to parse the timestamp from.
+   * @return The timestamp in Unix Epoch seconds.
+   * @since 2.4
+   */
+  public static long baseTime(final byte[] row) {
+    return Bytes.getUnsignedInt(row, Const.SALT_WIDTH() + TSDB.metrics_width());
+  }
+  
+  /**
+   * Sets the time in a raw data table row key
+   * @param row The row to modify
+   * @param base_time The base time to store
+   * @since 2.3
+   */
+  public static void setBaseTime(final byte[] row, int base_time) {
+    Bytes.setInt(row, base_time, Const.SALT_WIDTH() + 
+        TSDB.metrics_width());
+  }
+  
   /** @see Tags#getTags */
   public static Map<String, String> getTags(final TSDB tsdb, final byte[] row) {
     return Tags.getTags(tsdb, row);
@@ -114,13 +172,6 @@ public final class Internal {
     return tsdb.metrics.width();
   }
 
-  /** @see CompactionQueue#complexCompact  */
-  public static KeyValue complexCompact(final KeyValue kv) {
-    final ArrayList<KeyValue> kvs = new ArrayList<KeyValue>(1);
-    kvs.add(kv);
-    return CompactionQueue.complexCompact(kvs, kv.qualifier().length / 2, false);
-  }
-  
   /**
    * Extracts a Cell from a single data point, fixing potential errors with
    * the qualifier flags
@@ -190,46 +241,74 @@ public final class Internal {
       final byte[] qual = kv.qualifier();
       final int len = qual.length;
       final byte[] val = kv.value();
-      
-      if (len % 2 != 0) {
-        // skip a non data point column
-        continue;
-      } else if (len == 2) {  // Single-value cell.
-        // Maybe we need to fix the flags in the qualifier.
-        final byte[] actual_val = fixFloatingPointValue(qual[1], val);
-        final byte q = fixQualifierFlags(qual[1], actual_val.length);
-        final byte[] actual_qual;
-        
-        if (q != qual[1]) {  // We need to fix the qualifier.
-          actual_qual = new byte[] { qual[0], q };  // So make a copy.
-        } else {
-          actual_qual = qual;  // Otherwise use the one we already have.
+
+      // when enable_appends set to true, should get qualifier and value from the HBase Column Value
+      if (kv.qualifier()[0] == AppendDataPoints.APPEND_COLUMN_PREFIX) {
+        int idx = 0;
+        int q_length = 0;
+        int v_length = 0;
+        while (idx < kv.value().length) {
+          q_length = Internal.getQualifierLength(kv.value(), idx);
+          v_length = Internal.getValueLengthFromQualifier(kv.value(), idx);
+          final byte[] q = new byte[q_length];
+          final byte[] v = new byte[v_length];
+          System.arraycopy(kv.value(),idx,q,0,q_length);
+          System.arraycopy(kv.value(),idx + q_length,v, 0, v_length);
+          idx += q_length + v_length;
+
+          final Cell cell = new Cell(q, v);
+          cells.add(cell);
         }
-        
-        final Cell cell = new Cell(actual_qual, actual_val);
-        cells.add(cell);
         continue;
-      } else if (len == 4 && inMilliseconds(qual[0])) {
-        // since ms support is new, there's nothing to fix
-        final Cell cell = new Cell(qual, val);
-        cells.add(cell);
-        continue;
+      } else {
+
+        if (len % 2 != 0) {
+          // skip a non data point column
+          continue;
+        } else if (len == 2) {  // Single-value cell.
+          // Maybe we need to fix the flags in the qualifier.
+          final byte[] actual_val = fixFloatingPointValue(qual[1], val);
+          final byte q = fixQualifierFlags(qual[1], actual_val.length);
+          final byte[] actual_qual;
+
+          if (q != qual[1]) {  // We need to fix the qualifier.
+            actual_qual = new byte[]{qual[0], q};  // So make a copy.
+          } else {
+            actual_qual = qual;  // Otherwise use the one we already have.
+          }
+
+          final Cell cell = new Cell(actual_qual, actual_val);
+          cells.add(cell);
+          continue;
+        } else if (len == 4 && inMilliseconds(qual[0])) {
+          // since ms support is new, there's nothing to fix
+          final Cell cell = new Cell(qual, val);
+          cells.add(cell);
+          continue;
+        }
       }
       
       // Now break it down into Cells.
       int val_idx = 0;
-      for (int i = 0; i < len; i += 2) {
-        final byte[] q = extractQualifier(qual, i);
-        final int vlen = getValueLengthFromQualifier(qual, i);
-        if (inMilliseconds(qual[i])) {
-          i += 2;
+      try {
+        for (int i = 0; i < len; i += 2) {
+          final byte[] q = extractQualifier(qual, i);
+          final int vlen = getValueLengthFromQualifier(qual, i);
+          if (inMilliseconds(qual[i])) {
+            i += 2;
+          }
+          
+          final byte[] v = new byte[vlen];
+          System.arraycopy(val, val_idx, v, 0, vlen);
+          val_idx += vlen;
+          final Cell cell = new Cell(q, v);
+          cells.add(cell);
         }
-        
-        final byte[] v = new byte[vlen];
-        System.arraycopy(val, val_idx, v, 0, vlen);
-        val_idx += vlen;
-        final Cell cell = new Cell(q, v);
-        cells.add(cell);
+      } catch (ArrayIndexOutOfBoundsException e) {
+        throw new IllegalDataException("Corrupted value: couldn't break down"
+            + " into individual values (consumed " + val_idx + " bytes, but was"
+            + " expecting to consume " + (val.length - 1) + "): " + kv
+            + ", cells so far: " + cells);
       }
       
       // Check we consumed all the bytes of the value.  Remember the last byte
@@ -375,6 +454,47 @@ public final class Internal {
   }
 
   /**
+   * Callback used to fetch only the last data point from a row returned as the
+   * result of a GetRequest. Non data points will be parsed out and the
+   * resulting time and value stored in an IncomingDataPoint if found. If no 
+   * valid data was found, a null is returned.
+   * @since 2.0
+   */
+  public static class GetLastDataPointCB implements Callback<IncomingDataPoint, 
+    ArrayList<KeyValue>> {
+    final TSDB tsdb;
+    
+    public GetLastDataPointCB(final TSDB tsdb) {
+      this.tsdb = tsdb;
+    }
+    
+    /**
+     * Returns the last data point from a data row in the TSDB table.
+     * @param row The row from HBase
+     * @return null if no data was found, a data point if one was
+     */
+    public IncomingDataPoint call(final ArrayList<KeyValue> row) 
+      throws Exception {
+      if (row == null || row.size() < 1) {
+        return null;
+      }
+      
+      // check to see if the cells array is empty as it will flush out all
+      // non-data points.
+      final ArrayList<Cell> cells = extractDataPoints(row, row.size());
+      if (cells.isEmpty()) {
+        return null;
+      }
+      final Cell cell = cells.get(cells.size() - 1);
+      final IncomingDataPoint dp = new IncomingDataPoint();
+      final long base_time = baseTime(tsdb, row.get(0).key());
+      dp.setTimestamp(getTimestampFromQualifier(cell.qualifier(), base_time));
+      dp.setValue(cell.parseValue().toString());
+      return dp;
+    }
+  }
+  
+  /**
    * Compares two data point byte arrays with offsets.
    * Can be used on:
    * <ul><li>Single data point columns</li>
@@ -478,7 +598,7 @@ public final class Internal {
    * @since 2.0
    */
   public static boolean inMilliseconds(final byte[] qualifier, 
-      final byte offset) {
+      final int offset) {
     return inMilliseconds(qualifier[offset]);
   }
   
@@ -507,7 +627,7 @@ public final class Internal {
    * point qualifier
    * @param qualifier The qualifier to parse
    * @return The offset in milliseconds from the base time
-   * @throws IllegalArgument if the qualifier is null or empty
+   * @throws IllegalArgumentException if the qualifier is null or empty
    * @since 2.0
    */
   public static int getOffsetFromQualifier(final byte[] qualifier) {
@@ -541,7 +661,7 @@ public final class Internal {
    * Returns the length of the value, in bytes, parsed from the qualifier
    * @param qualifier The qualifier to parse
    * @return The length of the value in bytes, from 1 to 8.
-   * @throws IllegalArgument if the qualifier is null or empty
+   * @throws IllegalArgumentException if the qualifier is null or empty
    * @since 2.0
    */
   public static byte getValueLengthFromQualifier(final byte[] qualifier) {
@@ -553,7 +673,7 @@ public final class Internal {
    * @param qualifier The qualifier to parse
    * @param offset An offset within the byte array
    * @return The length of the value in bytes, from 1 to 8.
-   * @throws IllegalArgument if the qualifier is null or the offset falls 
+   * @throws IllegalArgumentException if the qualifier is null or the offset falls
    * outside of the qualifier array
    * @since 2.0
    */
@@ -573,7 +693,7 @@ public final class Internal {
    * Returns the length, in bytes, of the qualifier: 2 or 4 bytes
    * @param qualifier The qualifier to parse
    * @return The length of the qualifier in bytes
-   * @throws IllegalArgument if the qualifier is null or empty
+   * @throws IllegalArgumentException if the qualifier is null or empty
    * @since 2.0
    */
   public static short getQualifierLength(final byte[] qualifier) {
@@ -585,7 +705,7 @@ public final class Internal {
    * @param qualifier The qualifier to parse
    * @param offset An offset within the byte array
    * @return The length of the qualifier in bytes
-   * @throws IllegalArgument if the qualifier is null or the offset falls 
+   * @throws IllegalArgumentException if the qualifier is null or the offset falls
    * outside of the qualifier array
    * @since 2.0
    */
@@ -611,7 +731,7 @@ public final class Internal {
    * @param qualifier The qualifier to parse
    * @param base_time The base time, in seconds, from the row key
    * @return The absolute timestamp in milliseconds
-   * @throws IllegalArgument if the qualifier is null or empty
+   * @throws IllegalArgumentException if the qualifier is null or empty
    * @since 2.0
    */
   public static long getTimestampFromQualifier(final byte[] qualifier, 
@@ -625,7 +745,7 @@ public final class Internal {
    * @param base_time The base time, in seconds, from the row key
    * @param offset An offset within the byte array
    * @return The absolute timestamp in milliseconds
-   * @throws IllegalArgument if the qualifier is null or the offset falls 
+   * @throws IllegalArgumentException if the qualifier is null or the offset falls
    * outside of the qualifier array
    * @since 2.0
    */
@@ -638,7 +758,7 @@ public final class Internal {
    * Parses the flag bits from the qualifier
    * @param qualifier The qualifier to parse
    * @return A short representing the last 4 bits of the qualifier
-   * @throws IllegalArgument if the qualifier is null or empty
+   * @throws IllegalArgumentException if the qualifier is null or empty
    * @since 2.0
    */
   public static short getFlagsFromQualifier(final byte[] qualifier) {
@@ -650,7 +770,7 @@ public final class Internal {
    * @param qualifier The qualifier to parse
    * @param offset An offset within the byte array
    * @return A short representing the last 4 bits of the qualifier
-   * @throws IllegalArgument if the qualifier is null or the offset falls 
+   * @throws IllegalArgumentException if the qualifier is null or the offset falls
    * outside of the qualifier array
    * @since 2.0
    */
@@ -665,11 +785,43 @@ public final class Internal {
   }
 
   /**
+   * Parses the qualifier to determine if the data is a floating point value.
+   * 4 bytes == Float, 8 bytes == Double
+   * @param qualifier The qualifier to parse
+   * @return True if the encoded data is a floating point value
+   * @throws IllegalArgumentException if the qualifier is null or the offset falls
+   * outside of the qualifier array
+   * @since 2.1
+   */
+  public static boolean isFloat(final byte[] qualifier) {
+    return isFloat(qualifier, 0);
+  }
+
+  /**
+   * Parses the qualifier to determine if the data is a floating point value.
+   * 4 bytes == Float, 8 bytes == Double
+   * @param qualifier The qualifier to parse
+   * @param offset An offset within the byte array
+   * @return True if the encoded data is a floating point value
+   * @throws IllegalArgumentException if the qualifier is null or the offset falls
+   * outside of the qualifier array
+   * @since 2.1
+   */
+  public static boolean isFloat(final byte[] qualifier, final int offset) {
+    validateQualifier(qualifier, offset);
+    if ((qualifier[offset] & Const.MS_BYTE_FLAG) == Const.MS_BYTE_FLAG) {
+      return (qualifier[offset + 3] & Const.FLAG_FLOAT) == Const.FLAG_FLOAT; 
+    } else {
+      return (qualifier[offset + 1] & Const.FLAG_FLOAT) == Const.FLAG_FLOAT;
+    }
+  }
+  
+  /**
    * Extracts the 2 or 4 byte qualifier from a compacted byte array
    * @param qualifier The qualifier to parse
    * @param offset An offset within the byte array
    * @return A byte array with only the requested qualifier
-   * @throws IllegalArgument if the qualifier is null or the offset falls 
+   * @throws IllegalArgumentException if the qualifier is null or the offset falls
    * outside of the qualifier array
    * @since 2.0
    */
@@ -689,7 +841,7 @@ public final class Internal {
    * the timestamp is in seconds, this returns a 2 byte qualifier. If it's in
    * milliseconds, returns a 4 byte qualifier 
    * @param timestamp A Unix epoch timestamp in seconds or milliseconds
-   * @param flags Flags to set on the qualifier (length &| float)
+   * @param flags Flags to set on the qualifier (length &#38;| float)
    * @return A 2 or 4 byte qualifier for storage in column or compacted column
    * @since 2.0
    */
@@ -727,4 +879,228 @@ public final class Internal {
           qualifier.length + "]");
     }
   }
+
+  /**
+   * Sets the server-side regexp filter on the scanner.
+   * This will compile a list of the tagk/v pairs for the TSUIDs to prevent
+   * storage from returning irrelevant rows.
+   * @param scanner The scanner on which to add the filter.
+   * @param tsuids The list of TSUIDs to filter on 
+   * @since 2.1
+   */
+  public static void createAndSetTSUIDFilter(final Scanner scanner, 
+      final List<String> tsuids) {
+    Collections.sort(tsuids);
+    
+    // first, convert the tags to byte arrays and count up the total length
+    // so we can allocate the string builder
+    final short metric_width = TSDB.metrics_width();
+    int tags_length = 0;
+    final ArrayList<byte[]> uids = new ArrayList<byte[]>(tsuids.size());
+    for (final String tsuid : tsuids) {
+      final String tags = tsuid.substring(metric_width * 2);
+      final byte[] tag_bytes = UniqueId.stringToUid(tags);
+      tags_length += tag_bytes.length;
+      uids.add(tag_bytes);
+    }
+    
+    // Generate a regexp for our tags based on any metric and timestamp (since
+    // those are handled by the row start/stop) and the list of TSUID tagk/v
+    // pairs. The generated regex will look like: ^.{7}(tags|tags|tags)$
+    // where each "tags" is similar to \\Q\000\000\001\000\000\002\\E
+    final StringBuilder buf = new StringBuilder(
+        13  // "(?s)^.{N}(" + ")$"
+        + (tsuids.size() * 11) // "\\Q" + "\\E|"
+        + tags_length); // total # of bytes in tsuids tagk/v pairs
+    
+    // Alright, let's build this regexp.  From the beginning...
+    buf.append("(?s)"  // Ensure we use the DOTALL flag.
+               + "^.{")
+       // ... start by skipping the metric ID and timestamp.
+       .append(Const.SALT_WIDTH() + metric_width + Const.TIMESTAMP_BYTES)
+       .append("}(");
+    
+    for (final byte[] tags : uids) {
+       // quote the bytes
+      buf.append("\\Q");
+      UniqueId.addIdToRegexp(buf, tags);
+      buf.append('|');
+    }
+    
+    // Replace the pipe of the last iteration, close and set
+    buf.setCharAt(buf.length() - 1, ')');
+    buf.append("$");
+    scanner.setKeyRegexp(buf.toString(), Charset.forName("ISO-8859-1"));
+  }
+
+  /**
+   * Simple helper to calculate the max value for any width of long from 0 to 8
+   * bytes. 
+   * @param width The width of the byte array we're comparing
+   * @return The maximum unsigned integer value on {@code width} bytes. Note:
+   * If you ask for 8 bytes, it will return the max signed value. This is due
+   * to Java lacking unsigned integers... *sigh*.
+   * @since 2.2
+   */
+  public static long getMaxUnsignedValueOnBytes(final int width) {
+    if (width < 0 || width > 8) {
+      throw new IllegalArgumentException("Width must be from 1 to 8 bytes: " 
+          + width);
+    }
+    if (width < 8) {
+      return ((long) 1 << width * Byte.SIZE) - 1;
+    } else {
+      return Long.MAX_VALUE;
+    }
+  }
+
+  /**
+   * Encodes a long on 1, 2, 4 or 8 bytes
+   * @param value The value to encode
+   * @return A byte array containing the encoded value
+   * @since 2.4
+   */
+  public static byte[] vleEncodeLong(final long value) {
+    if (Byte.MIN_VALUE <= value && value <= Byte.MAX_VALUE) {
+      return new byte[] { (byte) value };
+    } else if (Short.MIN_VALUE <= value && value <= Short.MAX_VALUE) {
+      return Bytes.fromShort((short) value);
+    } else if (Integer.MIN_VALUE <= value && value <= Integer.MAX_VALUE) {
+      return Bytes.fromInt((int) value);
+    } else {
+      return Bytes.fromLong(value);
+    }
+  }
+
+  /**
+   * Returns true if the given TSUID matches the row key (accounting for salt and
+   * timestamp).
+   * @param tsuid A non-null TSUID array
+   * @param row_key A non-null row key array
+   * @return True if the TSUID matches the row key, false if not.
+   * @throws IllegalArgumentException if the arguments are invalid.
+   */
+  public static boolean rowKeyMatchsTSUID(final byte[] tsuid, 
+      final byte[] row_key) {
+    if (tsuid == null || row_key == null) {
+      throw new IllegalArgumentException("Neither tsuid or row key can be null");
+    }
+    if (row_key.length <= tsuid.length) {
+      throw new IllegalArgumentException("Row key cannot be the same or "
+          + "shorter than tsuid");
+    }
+    // check on the metric part
+    int index_tsuid = 0;
+    int index_row_key = 0;
+    for (index_tsuid = 0, index_row_key = Const.SALT_WIDTH(); index_tsuid < TSDB
+        .metrics_width(); ++index_tsuid, ++index_row_key) {
+      if (tsuid[index_tsuid] != row_key[index_row_key]) {
+        return false;
+      }
+    }
+
+    // check on the tagk tagv part
+    for (index_tsuid = TSDB.metrics_width(), index_row_key = Const.SALT_WIDTH() 
+        + TSDB.metrics_width() + Const.TIMESTAMP_BYTES; 
+        index_tsuid < tsuid.length; ++index_tsuid, 
+        ++index_row_key) {
+      if (tsuid[index_tsuid] != row_key[index_row_key]) {
+        return false;
+      }
+    } // end for
+
+    return true;
+  }
+
+  /**
+   * Calculates and returns the column qualifier. The qualifier is the offset
+   * of the {@code #timestamp} from the row key's base time stamp in seconds
+   * with a prefix of {@code #PREFIX}. Thus if the offset is 0 and the prefix is
+   * 1 and the timestamp is in seconds, the qualifier would be [1, 0, 0].
+   * Millisecond timestamps will have a 5 byte qualifier.
+   * @param timestamp The base timestamp.
+   * @param prefix The prefix to set at the start of the array.
+   * @return The column qualifier as a byte array
+   * @throws IllegalArgumentException if the start_time has not been set
+   * @since 2.4
+   */
+  public static byte[] getQualifier(final long timestamp, final byte prefix) {
+    if (timestamp < 1) {
+      throw new IllegalArgumentException("The start timestamp has not been set");
+    }
+
+    final long base_time;
+    final byte[] qualifier;
+    if ((timestamp & Const.SECOND_MASK) != 0) {
+      // drop the ms timestamp to seconds to calculate the base timestamp
+      base_time = ((timestamp / 1000) -
+              ((timestamp / 1000) % Const.MAX_TIMESPAN));
+      qualifier = new byte[5];
+      final int offset = (int) (timestamp - (base_time * 1000));
+      System.arraycopy(Bytes.fromInt(offset), 0, qualifier, 1, 4);
+    } else {
+      base_time = (timestamp - (timestamp % Const.MAX_TIMESPAN));
+      qualifier = new byte[3];
+      final short offset = (short) (timestamp - base_time);
+      System.arraycopy(Bytes.fromShort(offset), 0, qualifier, 1, 2);
+    }
+    qualifier[0] = prefix;
+    return qualifier;
+  }
+  
+  /**
+   * Get timestamp from base time and quantifier for non datapoints. The returned time
+   * will always be in ms.
+   * @param base_time the base time of the point
+   * @param quantifier the quantifier of the point, it is expected to be either length of
+   *                   3 or length of 5 (the first byte represents the type of the point)
+   * @return The timestamp in ms
+   */
+  public static long getTimeStampFromNonDP(final long base_time, byte[] quantifier) {
+    long ret = base_time;
+    if (quantifier.length == 3) {
+      ret += quantifier[1] << 8 | (quantifier[2] & 0xFF);
+      ret *= 1000;
+    } else if (quantifier.length == 5) {
+      ret *= 1000;
+      ret += (quantifier[1] & 0xFF) << 24 | (quantifier[2] & 0xFF) << 16
+              | (quantifier[3] & 0xFF) << 8 | quantifier[4] & 0xFF;
+    } else {
+      throw new IllegalArgumentException("Quantifier is not valid: " + Bytes.pretty(quantifier));
+    }
+
+    return ret;
+
+  }
+
+  /**
+   * Decode the histogram point from the given key value
+   * @param kv the key value that contains a histogram
+   * @return the decoded {@code HistogramDataPoint}
+     */
+  public static HistogramDataPoint decodeHistogramDataPoint(final TSDB tsdb,
+                                                            final KeyValue kv) {
+    long timestamp = Internal.baseTime(kv.key());
+    return decodeHistogramDataPoint(tsdb, timestamp, kv.qualifier(), kv.value());
+  }
+
+  /**
+   * Decode the histogram point from the given key and values
+   * @param tsdb The TSDB to use when fetching the decoder manager.
+   * @param base_time the base time of the histogram
+   * @param qualifier the qualifier used to store the histogram
+   * @param value the encoded value of the histogram
+   * @return the decoded {@code HistogramDataPoint}
+   */
+  public static HistogramDataPoint decodeHistogramDataPoint(final TSDB tsdb,
+                                                            final long base_time, 
+                                                            final byte[] qualifier,
+                                                            final byte[] value) {
+    final HistogramDataPointCodec decoder =
+            tsdb.histogramManager().getCodec((int) value[0]);
+    long timestamp = getTimeStampFromNonDP(base_time, qualifier);
+    final Histogram histogram = decoder.decode(value, true);
+    return new SimpleHistogramDataPointAdapter(histogram, timestamp);
+  }
+
 }

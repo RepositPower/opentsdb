@@ -12,24 +12,32 @@
 // see <http://www.gnu.org/licenses/>.
 package net.opentsdb.core;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.when;
 import static org.powermock.api.mockito.PowerMockito.mock;
+
+import java.util.List;
+
 import net.opentsdb.storage.MockBase;
 import net.opentsdb.uid.UniqueId;
 import net.opentsdb.utils.Config;
 
 import org.hbase.async.Bytes;
 import org.hbase.async.KeyValue;
+import org.hbase.async.Bytes.ByteMap;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
+import org.powermock.api.mockito.PowerMockito;
 import org.powermock.core.classloader.annotations.PowerMockIgnore;
 import org.powermock.core.classloader.annotations.PrepareForTest;
 import org.powermock.modules.junit4.PowerMockRunner;
 import org.powermock.reflect.Whitebox;
 
+import com.google.common.collect.Lists;
 import com.stumbleupon.async.Deferred;
 
 @RunWith(PowerMockRunner.class)
@@ -39,7 +47,7 @@ import com.stumbleupon.async.Deferred;
              "ch.qos.*", "org.slf4j.*",
              "com.sum.*", "org.xml.*"})
 @PrepareForTest({ RowSeq.class, TSDB.class, UniqueId.class, KeyValue.class, 
-Config.class, RowKey.class })
+  Config.class, RowKey.class, Const.class })
 public final class TestSpan {
   private TSDB tsdb = mock(TSDB.class);
   private Config config = mock(Config.class);
@@ -79,6 +87,31 @@ public final class TestSpan {
         MockBase.concatByteArrays(val1, val2, ZERO)));
     
     assertEquals(2, span.size());
+  }
+  
+  @Test
+  public void addRowSalted() {
+    PowerMockito.mockStatic(Const.class);
+    PowerMockito.when(Const.SALT_WIDTH()).thenReturn(1);
+    PowerMockito.when(Const.SALT_BUCKETS()).thenReturn(2);
+    
+    final byte[] qual1 = { 0x00, 0x07 };
+    final byte[] val1 = Bytes.fromLong(4L);
+    final byte[] qual2 = { 0x00, 0x27 };
+    final byte[] val2 = Bytes.fromLong(5L);
+    final byte[] qual12 = MockBase.concatByteArrays(qual1, qual2);
+    
+    final byte[] hour1 = { 0, 0, 0, 1, 0x50, (byte)0xE2, 0x27, 
+        0, 0, 0, 1, 0, 0, 2 };
+    final byte[] hour2 = { 1, 0, 0, 1, 0x50, (byte)0xE2, 0x35, 
+        0x10, 0, 0, 1, 0, 0, 2 };
+    final Span span = new Span(tsdb);
+    span.addRow(new KeyValue(hour1, FAMILY, qual12, 
+        MockBase.concatByteArrays(val1, val2, ZERO)));
+    span.addRow(new KeyValue(hour2, FAMILY, qual12, 
+        MockBase.concatByteArrays(val1, val2, ZERO)));
+    
+    assertEquals(4, span.size());
   }
   
   @Test (expected = NullPointerException.class)
@@ -302,6 +335,56 @@ public final class TestSpan {
   }
 
   @Test
+  public void downsampler() throws Exception {
+    final byte[] val40 = Bytes.fromLong(40L);
+    final byte[] val50 = Bytes.fromLong(50L);
+    // For a value at the offset 0 seconds from a base timestamp.
+    final byte[] qual0 = { 0x00, 0x07 };
+    // For a value at the offset 5 seconds from a base timestamp.
+    final byte[] qual5 = { 0x00, 0x57 };
+    // For a value at the offset 2000 (0x7D0) seconds from a base timestamp.
+    final byte[] qual2000 = { 0x7D, 0x07 };
+    // For values at the offsets 0 and 2000 seconds from a base timestamp.
+    final byte[] qual02000 = MockBase.concatByteArrays(qual0, qual2000);
+    // For values at the offsets 0 and 5 seconds from a base timestamp.
+    final byte[] qual05 = MockBase.concatByteArrays(qual0, qual5);
+
+    final Span span = new Span(tsdb);
+    span.addRow(new KeyValue(HOUR1, FAMILY, qual02000,
+        MockBase.concatByteArrays(val40, val50, ZERO)));
+    span.addRow(new KeyValue(HOUR2, FAMILY, qual05,
+        MockBase.concatByteArrays(val40, val50, ZERO)));
+    span.addRow(new KeyValue(HOUR3, FAMILY, qual02000,
+        MockBase.concatByteArrays(val40, val50, ZERO)));
+
+    assertEquals(6, span.size());
+    long interval_ms = 1000000;
+    Aggregator downsampler = Aggregators.get("avg");
+    final SeekableView it = span.downsampler(1356998000L, 1357007000L, 
+        interval_ms, downsampler, FillPolicy.NONE);
+    List<Double> values = Lists.newArrayList();
+    List<Long> timestamps_in_millis = Lists.newArrayList();
+    while (it.hasNext()) {
+      DataPoint dp = it.next();
+      assertFalse(dp.isInteger());
+      values.add(dp.doubleValue());
+      timestamps_in_millis.add(dp.timestamp());
+    }
+
+    assertEquals(5, values.size());
+    assertEquals(40, values.get(0).longValue());
+    assertEquals(1356998000000L, timestamps_in_millis.get(0).longValue());
+    assertEquals(50, values.get(1).longValue());
+    assertEquals(1357000000000L, timestamps_in_millis.get(1).longValue());
+    assertEquals(45, values.get(2).longValue());
+    assertEquals(1357002000000L, timestamps_in_millis.get(2).longValue());
+    assertEquals(40, values.get(3).longValue());
+    assertEquals(1357005000000L, timestamps_in_millis.get(3).longValue());
+    assertEquals(50, values.get(4).longValue());
+    assertEquals(1357007000000L, timestamps_in_millis.get(4).longValue());
+  }
+
+  @Test
   public void lastTimestampInRow() throws Exception {
     final byte[] qual1 = { 0x00, 0x07 };
     final byte[] val1 = Bytes.fromLong(4L);
@@ -328,4 +411,120 @@ public final class TestSpan {
     
     assertEquals(1356998400008L, Span.lastTimestampInRow((short) 3, kv));
   }
+  
+  @Test
+  public void metricUID() throws Exception {
+    final byte[] qual1 = { 0x00, 0x07 };
+    final byte[] val1 = Bytes.fromLong(4L);
+    final byte[] qual2 = { 0x00, 0x27 };
+    final byte[] val2 = Bytes.fromLong(5L);
+    final byte[] qual12 = MockBase.concatByteArrays(qual1, qual2);
+    
+    final Span span = new Span(tsdb);
+    span.addRow(new KeyValue(HOUR1, FAMILY, qual12, 
+        MockBase.concatByteArrays(val1, val2, ZERO)));
+    
+    assertEquals(2, span.size());
+    
+    assertArrayEquals(new byte[] { 0, 0, 1 }, span.metricUID());
+  }
+  
+  @Test
+  public void metricUIDSalted() throws Exception {
+    PowerMockito.mockStatic(Const.class);
+    PowerMockito.when(Const.SALT_WIDTH()).thenReturn(1);
+    PowerMockito.when(Const.SALT_BUCKETS()).thenReturn(2);
+    
+    final byte[] qual1 = { 0x00, 0x07 };
+    final byte[] val1 = Bytes.fromLong(4L);
+    final byte[] qual2 = { 0x00, 0x27 };
+    final byte[] val2 = Bytes.fromLong(5L);
+    final byte[] qual12 = MockBase.concatByteArrays(qual1, qual2);
+    
+    final Span span = new Span(tsdb);
+    final byte[] key = new byte[HOUR1.length + 1];
+    System.arraycopy(HOUR1, 0, key, 1, HOUR1.length);
+    span.addRow(new KeyValue(key, FAMILY, qual12, 
+        MockBase.concatByteArrays(val1, val2, ZERO)));
+    
+    assertEquals(2, span.size());
+    
+    assertArrayEquals(new byte[] { 0, 0, 1 }, span.metricUID());
+  }
+  
+  @Test
+  public void getTagUids() {
+    final byte[] qual1 = { 0x00, 0x07 };
+    final byte[] val1 = Bytes.fromLong(4L);
+    final byte[] qual2 = { 0x00, 0x27 };
+    final byte[] val2 = Bytes.fromLong(5L);
+    final byte[] qual12 = MockBase.concatByteArrays(qual1, qual2);
+    
+    final Span span = new Span(tsdb);
+    span.addRow(new KeyValue(HOUR1, FAMILY, qual12, 
+        MockBase.concatByteArrays(val1, val2, ZERO)));
+    
+    assertEquals(2, span.size());
+    final ByteMap<byte[]> uids = span.getTagUids();
+    assertEquals(1, uids.size());
+    assertArrayEquals(new byte[] { 0, 0, 1 }, uids.firstKey());
+    assertArrayEquals(new byte[] { 0, 0, 2 }, 
+        uids.firstEntry().getValue());
+  }
+  
+  @Test
+  public void getTagUidsSalted() {
+    PowerMockito.mockStatic(Const.class);
+    PowerMockito.when(Const.SALT_WIDTH()).thenReturn(1);
+    PowerMockito.when(Const.SALT_BUCKETS()).thenReturn(2);
+    
+    final byte[] qual1 = { 0x00, 0x07 };
+    final byte[] val1 = Bytes.fromLong(4L);
+    final byte[] qual2 = { 0x00, 0x27 };
+    final byte[] val2 = Bytes.fromLong(5L);
+    final byte[] qual12 = MockBase.concatByteArrays(qual1, qual2);
+    
+    final Span span = new Span(tsdb);
+    final byte[] key = new byte[HOUR1.length + 1];
+    System.arraycopy(HOUR1, 0, key, 1, HOUR1.length);
+    span.addRow(new KeyValue(key, FAMILY, qual12, 
+        MockBase.concatByteArrays(val1, val2, ZERO)));
+    
+    assertEquals(2, span.size());
+    final ByteMap<byte[]> uids = span.getTagUids();
+    assertEquals(1, uids.size());
+    assertArrayEquals(new byte[] { 0, 0, 1 }, uids.firstKey());
+    assertArrayEquals(new byte[] { 0, 0, 2 }, 
+        uids.firstEntry().getValue());
+  }
+  
+  @Test (expected = IllegalStateException.class)
+  public void getTagUidsNotSet() {
+    final Span span = new Span(tsdb);
+    span.getTagUids();
+  }
+
+  @Test
+  public void getAggregatedTagUids() {
+    final byte[] qual1 = { 0x00, 0x07 };
+    final byte[] val1 = Bytes.fromLong(4L);
+    final byte[] qual2 = { 0x00, 0x27 };
+    final byte[] val2 = Bytes.fromLong(5L);
+    final byte[] qual12 = MockBase.concatByteArrays(qual1, qual2);
+    
+    final Span span = new Span(tsdb);
+    span.addRow(new KeyValue(HOUR1, FAMILY, qual12, 
+        MockBase.concatByteArrays(val1, val2, ZERO)));
+    
+    assertEquals(2, span.size());
+    final List<byte[]> uids = span.getAggregatedTagUids();
+    assertEquals(0, uids.size());
+  }
+  
+  @Test
+  public void getAggregatedTagUidsNotSet() {
+    final Span span = new Span(tsdb);
+    assertTrue(span.getAggregatedTagUids().isEmpty());
+  }
+
 }

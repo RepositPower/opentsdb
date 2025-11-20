@@ -67,7 +67,7 @@ final class CliOptions {
 
   /**
    * Parse the command line arguments with the given options.
-   * @param options Options to parse in the given args.
+   * @param opt,ions Options to parse in the given args.
    * @param args Command line arguments to parse.
    * @return The remainder of the command line or
    * {@code null} if {@code args} were invalid and couldn't be parsed.
@@ -77,7 +77,7 @@ final class CliOptions {
       args = argp.parse(args);
     } catch (IllegalArgumentException e) {
       System.err.println("Invalid usage.  " + e.getMessage());
-      return null;
+      System.exit(2);
     }
     honorVerboseFlag(argp);
     return args;
@@ -107,7 +107,7 @@ final class CliOptions {
     config.setAutoMetric(config.getBoolean("tsd.core.auto_create_metrics"));
     return config;
   }
-  
+
   /**
    * Copies the parsed command line options to the {@link Config} class
    * @param config Configuration instance to override
@@ -120,6 +120,10 @@ final class CliOptions {
       // map the overrides
       if (entry.getKey().toLowerCase().equals("--auto-metric")) {
         config.overrideConfig("tsd.core.auto_create_metrics", "true");
+      } else if (entry.getKey().toLowerCase().equals("--disable-ui")) {
+        config.overrideConfig("tsd.core.enable_ui", "false");
+      } else if (entry.getKey().toLowerCase().equals("--disable-api")) {
+        config.overrideConfig("tsd.core.enable_api", "false");
       } else if (entry.getKey().toLowerCase().equals("--table")) {
         config.overrideConfig("tsd.storage.hbase.data_table", entry.getValue());
       } else if (entry.getKey().toLowerCase().equals("--uidtable")) {
@@ -140,16 +144,22 @@ final class CliOptions {
         config.overrideConfig("tsd.core.flushinterval", entry.getValue());
       } else if (entry.getKey().toLowerCase().equals("--backlog")) {
         config.overrideConfig("tsd.network.backlog", entry.getValue());
+      } else if (entry.getKey().toLowerCase().equals("--read-only")) {
+        config.overrideConfig("tsd.mode", "ro");
       } else if (entry.getKey().toLowerCase().equals("--bind")) {
         config.overrideConfig("tsd.network.bind", entry.getValue());
       } else if (entry.getKey().toLowerCase().equals("--async-io")) {
         config.overrideConfig("tsd.network.async_io", entry.getValue());
       } else if (entry.getKey().toLowerCase().equals("--worker-threads")) {
         config.overrideConfig("tsd.network.worker_threads", entry.getValue());
+      } else if(entry.getKey().toLowerCase().equals("--use-otsdb-ts")) {
+        config.overrideConfig("tsd.storage.use_otsdb_timestamp", "true");
+      } else if (entry.getKey().toLowerCase().equals("--dtc-ts")) {
+        config.overrideConfig("tsd.storage.get_date_tiered_compaction_start", entry.getValue());
       }
     }
   }
-  
+
   /** Changes the log level to 'WARN' unless --verbose is passed.  */
   private static void honorVerboseFlag(final ArgP argp) {
     if (argp.optionExists("--verbose") && !argp.has("--verbose")

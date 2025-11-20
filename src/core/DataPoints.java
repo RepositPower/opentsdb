@@ -1,5 +1,5 @@
 // This file is part of OpenTSDB.
-// Copyright (C) 2010-2012  The OpenTSDB Authors.
+// Copyright (C) 2010-2017  The OpenTSDB Authors.
 //
 // This program is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by
@@ -14,6 +14,8 @@ package net.opentsdb.core;
 
 import java.util.List;
 import java.util.Map;
+
+import org.hbase.async.Bytes.ByteMap;
 
 import com.stumbleupon.async.Deferred;
 
@@ -36,6 +38,12 @@ public interface DataPoints extends Iterable<DataPoint> {
    * @since 1.2
    */
   Deferred<String> metricNameAsync();
+  
+  /**
+   * @return the metric UID
+   * @since 2.3
+   */
+  byte[] metricUID();
 
   /**
    * Returns the tags associated with these data points.
@@ -49,6 +57,16 @@ public interface DataPoints extends Iterable<DataPoint> {
    * @since 1.2
    */
   Deferred<Map<String, String>> getTagsAsync();
+  
+  /**
+   * Returns a map of tag pairs as UIDs.
+   * When used on a span or row, it returns the tag set. When used on a span 
+   * group it will return only the tag pairs that are common across all 
+   * time series in the group.
+   * @return A potentially empty map of tagk to tagv pairs as UIDs
+   * @since 2.2
+   */
+  ByteMap<byte[]> getTagUids();
 
   /**
    * Returns the tags associated with some but not all of the data points.
@@ -81,6 +99,13 @@ public interface DataPoints extends Iterable<DataPoint> {
    */
   Deferred<List<String>> getAggregatedTagsAsync();
 
+  /**
+   * Returns the tagk UIDs associated with some but not all of the data points. 
+   * @return a non-{@code null} list of tagk UIDs.
+   * @since 2.3
+   */
+  List<byte[]> getAggregatedTagUids();
+  
   /**
    * Returns a list of unique TSUIDs contained in the results
    * @return an empty list if there were no results, otherwise a list of TSUIDs
@@ -185,4 +210,31 @@ public interface DataPoints extends Iterable<DataPoint> {
    */
   double doubleValue(int i);
 
+  /**
+   * Return the query index that maps this datapoints to the original TSSubQuery.
+   * @return index of the query in the TSQuery class
+   * @throws UnsupportedOperationException if the implementing class can't map
+   * to a sub query.
+   * @since 2.2
+   */
+  int getQueryIndex();
+  
+  /**
+   * Return whether these data points are the result of the percentile calculation 
+   * on the histogram data points. The client can call {@code getPercentile} to get
+   * the percentile calculation parameter.
+   * 
+   * @return true or false
+   * @since 2.4
+   */
+  boolean isPercentile();
+  
+  /**
+   * Return the percentile calculation parameter. This interface and {@code isPercentile} are used 
+   * to convert {@code HistogramDataPoints} to {@code DataPoints}
+   * 
+   * @return the percentile parameter
+   * @since 2.4
+   */
+  float getPercentile();
 }

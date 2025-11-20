@@ -12,6 +12,8 @@
 // see <http://www.gnu.org/licenses/>.
 package net.opentsdb.tsd;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +27,7 @@ import org.jboss.netty.handler.codec.http.HttpResponseStatus;
 import ch.qos.logback.classic.spi.ThrowableProxy;
 import ch.qos.logback.classic.spi.ThrowableProxyUtil;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.stumbleupon.async.Deferred;
 
 import net.opentsdb.core.DataPoints;
@@ -38,7 +41,10 @@ import net.opentsdb.search.SearchQuery;
 import net.opentsdb.tree.Branch;
 import net.opentsdb.tree.Tree;
 import net.opentsdb.tree.TreeRule;
+import net.opentsdb.tsd.AnnotationRpc.AnnotationBulkDelete;
+import net.opentsdb.tsd.QueryRpc.LastPointQuery;
 import net.opentsdb.utils.Config;
+import net.opentsdb.utils.JSONException;
 
 /**
  * Abstract base class for Serializers; plugins that handle converting requests
@@ -172,6 +178,23 @@ public abstract class HttpSerializer {
   }
   
   /**
+   * Parses one or more data points for storage
+   * @param <T> The type of incoming data points to parse.
+   * @param type The type of the class to parse.
+   * @param typeReference The reference to use for parsing.
+   * @return an array of data points to process for storage
+   * @throws BadRequestException if the plugin has not implemented this method
+   * @since 2.4
+   */
+  public <T extends IncomingDataPoint> List<T> parsePutV1(final Class<T> type,
+      final TypeReference<ArrayList<T>> typeReference) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED,
+        "The requested API endpoint has not been implemented",
+        this.getClass().getCanonicalName() +
+            " has not implemented parsePutV1");
+  }
+  
+  /**
    * Parses a suggestion query
    * @return a hash map of key/value pairs
    * @throws BadRequestException if the plugin has not implemented this method
@@ -196,6 +219,18 @@ public abstract class HttpSerializer {
   }
   
   /**
+   * Parses metrics, tagk or tagvs type and name to rename UID
+   * @return as hash map of type and name
+   * @throws BadRequestException if the plugin has not implemented this method
+   */
+  public HashMap<String, String> parseUidRenameV1() {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED,
+        "The requested API endpoint has not been implemented",
+        this.getClass().getCanonicalName() +
+        " has not implemented parseUidRenameV1");
+  }
+
+  /**
    * Parses a SearchQuery request
    * @return The parsed search query
    * @throws BadRequestException if the plugin has not implemented this method
@@ -217,6 +252,18 @@ public abstract class HttpSerializer {
         "The requested API endpoint has not been implemented", 
         this.getClass().getCanonicalName() + 
         " has not implemented parseQueryV1");
+  }
+  
+  /**
+   * Parses a last data point query
+   * @return A LastPointQuery to work with
+   * @throws BadRequestException if the plugin has not implemented this method
+   */
+  public LastPointQuery parseLastPointQueryV1() {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented parseLastPointQueryV1");
   }
   
   /**
@@ -283,7 +330,7 @@ public abstract class HttpSerializer {
    * Parses a tree ID and optional list of TSUIDs to search for collisions or
    * not matched TSUIDs.
    * @return A map with "treeId" as an integer and optionally "tsuids" as a 
-   * List<String> 
+   * List&lt;String&gt; 
    * @throws BadRequestException if the plugin has not implemented this method
    */
   public Map<String, Object> parseTreeTSUIDsListV1() {
@@ -306,11 +353,35 @@ public abstract class HttpSerializer {
   }
   
   /**
+   * Parses a list of annotation objects
+   * @return A list of annotation object
+   * @throws BadRequestException if the plugin has not implemented this method
+   */
+  public List<Annotation> parseAnnotationsV1() {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented parseAnnotationsV1");
+  }
+  
+  /**
+   * Parses a bulk annotation deletion query object
+   * @return Settings used to bulk delete annotations
+   * @throws BadRequestException if the plugin has not implemented this method
+   */
+  public AnnotationBulkDelete parseAnnotationBulkDeleteV1() {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented parseAnnotationBulkDeleteV1");
+  }
+  
+  /**
    * Formats the results of an HTTP data point storage request
    * @param results A map of results. The map will consist of:
    * <ul><li>success - (long) the number of successfully parsed datapoints</li>
    * <li>failed - (long) the number of datapoint parsing failures</li>
-   * <li>errors - (ArrayList<HashMap<String, Object>>) an optional list of 
+   * <li>errors - (ArrayList&lt;HashMap&lt;String, Object&gt;&gt;) an optional list of 
    * datapoints that had errors. The nested map has these fields:
    * <ul><li>error - (String) the error that occurred</li>
    * <li>datapoint - (IncomingDatapoint) the datapoint that generated the error
@@ -405,6 +476,19 @@ public abstract class HttpSerializer {
   }
   
   /**
+   * Format a response from the Uid Rename RPC
+   * @param response A map of result and reason for error of the rename
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   */
+  public ChannelBuffer formatUidRenameV1(final Map<String, String> response) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED,
+        "The requested API endpoint has not been implemented",
+        this.getClass().getCanonicalName() +
+        " has not implemented formatUidRenameV1");
+  }
+
+  /**
    * Format the results from a timeseries data query
    * @param query The TSQuery object used to fetch the results
    * @param results The data fetched from storage
@@ -418,6 +502,38 @@ public abstract class HttpSerializer {
         "The requested API endpoint has not been implemented", 
         this.getClass().getCanonicalName() + 
         " has not implemented formatQueryV1");
+  }
+  
+  /**
+   * Format the results from a timeseries data query
+   * @param query The TSQuery object used to fetch the results
+   * @param results The data fetched from storage
+   * @param globals An optional list of global annotation objects
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   * @since 2.2
+   */
+  public Deferred<ChannelBuffer> formatQueryAsyncV1(final TSQuery query, 
+      final List<DataPoints[]> results, final List<Annotation> globals) 
+      throws IOException {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatQueryV1");
+  }
+  
+  /**
+   * Format a list of last data points
+   * @param data_points The results of the query
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   */
+  public ChannelBuffer formatLastPointQueryV1(
+      final List<IncomingDataPoint> data_points) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatLastPointQueryV1");
   }
   
   /**
@@ -440,6 +556,19 @@ public abstract class HttpSerializer {
    * @throws BadRequestException if the plugin has not implemented this method
    */
   public ChannelBuffer formatTSMetaV1(final TSMeta meta) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatTSMetaV1");
+  }
+  
+  /**
+   * Format a a list of TSMeta objects
+   * @param metas The list of TSMeta objects to serialize
+   * @return A JSON structure
+   * @throws JSONException if serialization failed
+   */
+  public ChannelBuffer formatTSMetaListV1(final List<TSMeta> metas) {
     throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
         "The requested API endpoint has not been implemented", 
         this.getClass().getCanonicalName() + 
@@ -522,7 +651,7 @@ public abstract class HttpSerializer {
    * @param results The list of results. Main map key is the tsuid. Child map:
    * "branch" : Parsed branch result, may be null
    * "meta" : TSMeta object, may be null
-   * "messages" : An ArrayList<String> of one or more messages 
+   * "messages" : An ArrayList&lt;String&gt; of one or more messages 
    * @return A ChannelBuffer object to pass on to the caller
    * @throws BadRequestException if the plugin has not implemented this method
    */
@@ -548,6 +677,33 @@ public abstract class HttpSerializer {
   }
   
   /**
+   * Format a list of annotation objects
+   * @param notes The annotation objects to format
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   */
+  public ChannelBuffer formatAnnotationsV1(final List<Annotation> notes) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatAnnotationsV1");
+  }
+  
+  /**
+   * Format the results of a bulk annotation deletion
+   * @param request The request to handle.
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   */
+  public ChannelBuffer formatAnnotationBulkDeleteV1(
+      final AnnotationBulkDelete request) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatAnnotationBulkDeleteV1");
+  }
+
+  /**
    * Format a list of statistics
    * @param stats The statistics list to format
    * @return A ChannelBuffer object to pass on to the caller
@@ -558,6 +714,62 @@ public abstract class HttpSerializer {
         "The requested API endpoint has not been implemented", 
         this.getClass().getCanonicalName() + 
         " has not implemented formatStatsV1");
+  }
+  
+  /**
+   * Format a list of thread statistics
+   * @param stats The thread statistics list to format
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   * @since 2.2
+   */
+  public ChannelBuffer formatThreadStatsV1(final List<Map<String, Object>> stats) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatThreadStatsV1");
+  }
+  
+  /**
+   * format a list of region client statistics
+   * @param stats The list of region client stats to format
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   * @since 2.2
+   */
+  public ChannelBuffer formatRegionStatsV1(final List<Map<String, Object>> stats) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatRegionStatsV1");
+  }
+  
+  /**
+   * Format a list of JVM statistics
+   * @param map The JVM stats list to format
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   * @since 2.2
+   */
+  public ChannelBuffer formatJVMStatsV1(final Map<String, Map<String, Object>> map) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatJVMStatsV1");
+  }
+  
+  /**
+   * Format the query stats
+   * @param query_stats Map of query statistics
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   * @since 2.2
+   */
+  public ChannelBuffer formatQueryStatsV1(final Map<String, Object> query_stats) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatQueryStatsV1");
   }
   
   /**
@@ -584,6 +796,20 @@ public abstract class HttpSerializer {
         "The requested API endpoint has not been implemented", 
         this.getClass().getCanonicalName() + 
         " has not implemented formatConfigV1");
+  }
+  
+  /**
+   * Format the loaded filter configurations
+   * @param config The filters to serialize
+   * @return A ChannelBuffer object to pass on to the caller
+   * @throws BadRequestException if the plugin has not implemented this method
+   */
+  public ChannelBuffer formatFilterConfigV1(
+      final Map<String, Map<String, String>> config) {
+    throw new BadRequestException(HttpResponseStatus.NOT_IMPLEMENTED, 
+        "The requested API endpoint has not been implemented", 
+        this.getClass().getCanonicalName() + 
+        " has not implemented formatFilterConfigV1");
   }
   
   /**

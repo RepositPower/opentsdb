@@ -16,7 +16,9 @@ import java.io.IOException;
 
 import net.opentsdb.core.TSDB;
 
-/** Base interface for all HTTP query handlers. */
+/**
+ * Base interface for all built-in HTTP query handlers.
+ */
 interface HttpRpc {
 
   /**
@@ -24,6 +26,6 @@ interface HttpRpc {
    * @param tsdb The TSDB to use.
    * @param query The HTTP query to execute.
    */
-  void execute(TSDB tsdb, HttpQuery query) throws IOException;
+  void execute(TSDB tsdb, HttpQuery query) throws BadRequestException, IOException;
 
 }

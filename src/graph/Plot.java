@@ -1,5 +1,5 @@
 // This file is part of OpenTSDB.
-// Copyright (C) 2010-2012  The OpenTSDB Authors.
+// Copyright (C) 2010-2021  The OpenTSDB Authors.
 //
 // This program is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by
@@ -12,6 +12,7 @@
 // see <http://www.gnu.org/licenses/>.
 package net.opentsdb.graph;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.util.ArrayList;
@@ -23,9 +24,11 @@ import java.util.TimeZone;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import net.opentsdb.core.Const;
 import net.opentsdb.core.DataPoint;
 import net.opentsdb.core.DataPoints;
 import net.opentsdb.meta.Annotation;
+import net.opentsdb.utils.FileSystem;
 
 /**
  * Produces files to generate graphs with Gnuplot.
@@ -131,6 +134,13 @@ public final class Plot {
    * </ul>
    */
   public void setParams(final Map<String, String> params) {
+    // check "format y" and "format y2"
+    String[] y_format_keys = {"format y", "format y2"};
+    for(String k : y_format_keys){
+      if(params.containsKey(k)){
+        params.put(k, params.get(k));
+      }
+    }
     this.params = params;
   }
 
@@ -194,28 +204,40 @@ public final class Plot {
     int npoints = 0;
     final int nseries = datapoints.size();
     final String datafiles[] = nseries > 0 ? new String[nseries] : null;
+    FileSystem.checkDirectory(new File(basepath).getParent(),
+        Const.MUST_BE_WRITEABLE, Const.CREATE_IF_NEEDED);
     for (int i = 0; i < nseries; i++) {
       datafiles[i] = basepath + "_" + i + ".dat";
       final PrintWriter datafile = new PrintWriter(datafiles[i]);
       try {
         for (final DataPoint d : datapoints.get(i)) {
-          final long ts = d.timestamp() / 1000;
-          if (ts >= (start_time & UNSIGNED) && ts <= (end_time & UNSIGNED)) {
-            npoints++;
-          }
-          datafile.print(ts + utc_offset);
-          datafile.print(' ');
+          final long ts = d.timestamp() / 1000;          
           if (d.isInteger()) {
+            datafile.print(ts + utc_offset);
+            datafile.print(' ');
             datafile.print(d.longValue());
           } else {
             final double value = d.doubleValue();
-            if (value != value || Double.isInfinite(value)) {
-              throw new IllegalStateException("NaN or Infinity found in"
+
+            if (Double.isInfinite(value)) {
+              // Infinity is invalid.
+              throw new IllegalStateException("Infinity found in"
                   + " datapoints #" + i + ": " + value + " d=" + d);
+            } else if (Double.isNaN(value)) {
+              // NaNs should be skipped.
+              continue;
             }
+
+            datafile.print(ts + utc_offset);
+            datafile.print(' ');
             datafile.print(value);
           }
+          
           datafile.print('\n');
+          
+          if (ts >= (start_time & UNSIGNED) && ts <= (end_time & UNSIGNED)) {
+            npoints++;
+          }
         }
       } finally {
         datafile.close();
@@ -253,6 +275,7 @@ public final class Plot {
         .append(Short.toString(height));
       final String smooth = params.remove("smooth");
       final String fgcolor = params.remove("fgcolor");
+      final String style = params.remove("style");
       String bgcolor = params.remove("bgcolor");
       if (fgcolor != null && bgcolor == null) {
         // We can't specify a fgcolor without specifying a bgcolor.
@@ -287,7 +310,8 @@ public final class Plot {
       final int nseries = datapoints.size();
       if (nseries > 0) {
         gp.write("set grid\n"
-                 + "set style data linespoints\n");
+                 + "set style data ");
+        gp.append(style != null? style : "linespoint").append("\n");
         if (!params.containsKey("key")) {
           gp.write("set key right box\n");
         }
@@ -393,5 +417,4 @@ public final class Plot {
       return "%Y/%m/%d";
     }
   }
-
 }

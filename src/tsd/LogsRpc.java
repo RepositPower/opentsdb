@@ -12,6 +12,7 @@
 // see <http://www.gnu.org/licenses/>.
 package net.opentsdb.tsd;
 
+import org.jboss.netty.handler.codec.http.HttpMethod;
 import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.core.JsonGenerationException;
@@ -35,8 +36,13 @@ import net.opentsdb.utils.JSON;
 final class LogsRpc implements HttpRpc {
 
   public void execute(final TSDB tsdb, final HttpQuery query) 
-    throws JsonGenerationException, IOException {
+    throws BadRequestException, IOException {
+
+    // only accept GET/POST
+    RpcUtil.allowedMethods(query.method(), HttpMethod.GET.getName(), HttpMethod.POST.getName());
+
     LogIterator logmsgs = new LogIterator();
+
     if (query.hasQueryStringParam("json")) {
       ArrayList<String> logs = new ArrayList<String>();
       for (String log : logmsgs) {
@@ -93,6 +99,11 @@ final class LogsRpc implements HttpRpc {
       final Logger root =
         (Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME);
       logbuf = (CyclicBufferAppender<ILoggingEvent>) root.getAppender("CYCLIC");
+      if (logbuf == null) {
+        throw new BadRequestException(
+            "No CyclicBufferAppender found. Please configure logback "
+            + "to store the latest log entries.");
+      }
     }
 
     public Iterator<String> iterator() {

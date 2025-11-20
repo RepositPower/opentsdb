@@ -22,7 +22,7 @@ import com.stumbleupon.async.Deferred;
 import net.opentsdb.uid.NoSuchUniqueName;
 
 /**
- * A query to retreive data from the TSDB.
+ * A query to retrieve data from the TSDB.
  */
 public interface Query {
 
@@ -40,8 +40,8 @@ public interface Query {
   /**
    * Returns the start time of the graph.
    * @return A strictly positive integer.
-   * @throws IllegalStateException if {@link #setStartTime} was never called on
-   * this instance before.
+   * @throws IllegalStateException if {@link #setStartTime(long)} was never 
+   * called on this instance before.
    */
   long getStartTime();
 
@@ -66,10 +66,24 @@ public interface Query {
    * @return A strictly positive integer.
    */
   long getEndTime();
+  
+  /**
+   * Sets whether or not the data queried will be deleted.
+   * @param delete True if data should be deleted, false otherwise.
+   * @since 2.2
+   */
+  void setDelete(boolean delete);
 
   /**
+   * Returns whether or not the data queried will be deleted.
+   * @return A boolean
+   * @since 2.2
+   */
+  boolean getDelete();
+  
+  /**
   * Sets the time series to the query.
-  * @param metric The metric to retreive from the TSDB.
+  * @param metric The metric to retrieve from the TSDB.
   * @param tags The set of tags of interest.
   * @param function The aggregation function to use.
   * @param rate If true, the rate of the series will be used instead of the
@@ -86,7 +100,7 @@ public interface Query {
     
   /**
    * Sets the time series to the query.
-   * @param metric The metric to retreive from the TSDB.
+   * @param metric The metric to retrieve from the TSDB.
    * @param tags The set of tags of interest.
    * @param function The aggregation function to use.
    * @param rate If true, the rate of the series will be used instead of the
@@ -105,7 +119,7 @@ public interface Query {
    * to run asynchronously and use different scanners, we can allow different 
    * TSUIDs.
    * <b>Note:</b> This method will not check to determine if the TSUIDs are 
-   * valid, since that wastes time and we *assume* that the user provides TUSIDs
+   * valid, since that wastes time and we *assume* that the user provides TSUIDs
    * that are up to date.
    * @param tsuids A list of one or more TSUIDs to scan for
    * @param function The aggregation function to use on results
@@ -125,7 +139,7 @@ public interface Query {
    * to run asynchronously and use different scanners, we can allow different 
    * TSUIDs.
    * <b>Note:</b> This method will not check to determine if the TSUIDs are 
-   * valid, since that wastes time and we *assume* that the user provides TUSIDs
+   * valid, since that wastes time and we *assume* that the user provides TSUIDs
    * that are up to date.
    * @param tsuids A list of one or more TSUIDs to scan for
    * @param function The aggregation function to use on results
@@ -141,6 +155,40 @@ public interface Query {
       final RateOptions rate_options);
   
   /**
+   * Prepares a query against HBase by setting up group bys and resolving
+   * strings to UIDs asynchronously. This replaces calls to all of the setters
+   * like the {@link setTimeSeries}, {@link setStartTime}, etc. 
+   * Make sure to wait on the deferred return before calling {@link runAsync}. 
+   * @param query The main query to fetch the start and end time from
+   * @param index The index of which sub query we're executing
+   * @return A deferred to wait on for UID resolution. The result doesn't have
+   * any meaning and can be discarded.
+   * @throws IllegalArgumentException if the query was missing sub queries or
+   * the index was out of bounds.
+   * @throws NoSuchUniqueName if the name of a metric, or a tag name/value
+   * does not exist. (Bubbles up through the deferred)
+   * @since 2.2
+   */
+  public Deferred<Object> configureFromQuery(final TSQuery query, 
+      final int index);
+
+  /**
+   * Prepares a query against HBase by setting up group bys and resolving
+   * strings to UIDs asynchronously. This replaces calls to all of the setters
+   * like the {@link setTimeSeries}, {@link setStartTime}, etc.
+   * Make sure to wait on the deferred return before calling {@link runAsync}.
+   * @param query The main query to fetch the start and end time from
+   * @param index The index of which sub query we're executing
+   * @param force_raw If true, always get the data from the raw table; disables rollups
+   * @throws IllegalArgumentException if the query was missing sub queries or
+   * the index was out of bounds.
+   * @throws NoSuchUniqueName if the name of a metric, or a tag name/value
+   * does not exist. (Bubbles up through the deferred)
+   * @since 2.4
+   */
+  Deferred<Object> configureFromQuery(final TSQuery query, final int index, boolean force_raw);
+
+  /**
    * Downsamples the results by specifying a fixed interval between points.
    * <p>
    * Technically, downsampling means reducing the sampling interval.  Here
@@ -149,11 +197,23 @@ public interface Query {
    * way we get this one data point is by aggregating all the data points of
    * that interval together using an {@link Aggregator}.  This enables you
    * to compute things like the 5-minute average or 10 minute 99th percentile.
-   * @param interval Number of seconds wanted between each data point.
+   * @param interval Number of milliseconds wanted between each data point.
    * @param downsampler Aggregation function to use to group data points
    * within an interval.
    */
   void downsample(long interval, Aggregator downsampler);
+
+  /**
+   * Sets an optional downsampling function on this query
+   * @param interval The interval, in milliseconds to rollup data points
+   * @param downsampler An aggregation function to use when rolling up data points
+   * @param fill_policy Policy specifying whether to interpolate or to fill
+   * missing intervals with special values.
+   * @throws NullPointerException if the aggregation function is null
+   * @throws IllegalArgumentException if the interval is not greater than 0
+   * @since 2.2
+   */
+  void downsample(long interval, Aggregator downsampler, FillPolicy fill_policy);
 
   /**
    * Runs this query.
@@ -168,6 +228,19 @@ public interface Query {
   DataPoints[] run() throws HBaseException;
 
   /**
+   * Runs this query.
+   * @return The data points matched by this query and applied with percentile calculation
+   * <p>
+   * Each element in the non-{@code null} but possibly empty array returned
+   * corresponds to one time series for which some data points have been
+   * matched by the query.
+   * @throws HBaseException if there was a problem communicating with HBase to
+   * perform the search.
+   * @throws IllegalStateException if the query is not a histogram query
+   */
+  DataPoints[] runHistogram() throws HBaseException;
+  
+  /**
    * Executes the query asynchronously
    * @return The data points matched by this query.
    * <p>
@@ -179,4 +252,50 @@ public interface Query {
    * @since 1.2
    */
   public Deferred<DataPoints[]> runAsync() throws HBaseException;
+
+  /**
+   * Runs this query asynchronously.
+   * @return The data points matched by this query and applied with percentile calculation
+   * <p>
+   * Each element in the non-{@code null} but possibly empty array returned
+   * corresponds to one time series for which some data points have been
+   * matched by the query.
+   * @throws HBaseException if there was a problem communicating with HBase to
+   * perform the search.
+   * @throws IllegalStateException if the query is not a histogram query
+   */
+  Deferred<DataPoints[]> runHistogramAsync() throws HBaseException;
+  
+  /**
+   * Returns an index for this sub-query in the original set of queries.
+   * @return A zero based index.
+   * @since 2.4 
+   */
+  public int getQueryIdx();
+
+  /**
+   * Check this is a histogram query or not
+   * @return
+   */
+  public boolean isHistogramQuery();
+
+  /**
+   * @return Whether or not this is a rollup query
+   * @since 2.4
+   */
+  public boolean isRollupQuery();
+
+  /**
+   * @return whether this query needs to be split.
+   * @since 2.4
+   */
+  public boolean needsSplitting();
+
+  /**
+   * Set the percentile calculation parameters for this query if this is 
+   * a histogram query
+   * 
+   * @param percentiles
+   */
+  public void setPercentiles(List<Float> percentiles);
 }

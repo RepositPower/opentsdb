@@ -24,6 +24,7 @@ import net.opentsdb.meta.Annotation;
 
 import org.hbase.async.Bytes;
 import org.hbase.async.KeyValue;
+import org.hbase.async.Bytes.ByteMap;
 
 import com.stumbleupon.async.Deferred;
 
@@ -35,7 +36,7 @@ import com.stumbleupon.async.Deferred;
  * are stored in two byte arrays: one for the time offsets/flags and another
  * for the values. Access is granted via pointers.
  */
-final class RowSeq implements DataPoints {
+public final class RowSeq implements iRowSeq {
 
   /** The {@link TSDB} instance we belong to. */
   private final TSDB tsdb;
@@ -63,13 +64,9 @@ final class RowSeq implements DataPoints {
   RowSeq(final TSDB tsdb) {
     this.tsdb = tsdb;
   }
-
-  /**
-   * Sets the row this instance holds in RAM using a row from a scanner.
-   * @param row The compacted HBase row to set.
-   * @throws IllegalStateException if this method was already called.
-   */
-  void setRow(final KeyValue row) {
+  
+  @Override
+  public void setRow(final KeyValue row) {
     if (this.key != null) {
       throw new IllegalStateException("setRow was already called on " + this);
     }
@@ -83,19 +80,22 @@ final class RowSeq implements DataPoints {
    * Merges data points for the same HBase row into the local object.
    * When executing multiple async queries simultaneously, they may call into 
    * this method with data sets that are out of order. This may ONLY be called 
-   * after setRow() has initiated the rowseq.
+   * after setRow() has initiated the rowseq. It also allows for rows with 
+   * different salt bucket IDs to be merged into the same sequence.
    * @param row The compacted HBase row to merge into this instance.
    * @throws IllegalStateException if {@link #setRow} wasn't called first.
    * @throws IllegalArgumentException if the data points in the argument
    * do not belong to the same row as this RowSeq
    */
-  void addRow(final KeyValue row) {
+  @Override
+  public void addRow(final KeyValue row) {
     if (this.key == null) {
       throw new IllegalStateException("setRow was never called on " + this);
     }
 
     final byte[] key = row.key();
-    if (!Bytes.equals(this.key, key)) {
+    if (Bytes.memcmp(this.key, key, Const.SALT_WIDTH(), 
+        key.length - Const.SALT_WIDTH()) != 0) {
       throw new IllegalDataException("Attempt to add a different row="
           + row + ", this=" + this);
     }
@@ -282,6 +282,12 @@ final class RowSeq implements DataPoints {
     return RowKey.metricNameAsync(tsdb, key);
   }
   
+  @Override
+  public byte[] metricUID() {
+    return Arrays.copyOfRange(key, Const.SALT_WIDTH(), 
+        Const.SALT_WIDTH() + TSDB.metrics_width());
+  }
+  
   public Map<String, String> getTags() {
     try {
       return getTagsAsync().joinUninterruptibly();
@@ -290,6 +296,11 @@ final class RowSeq implements DataPoints {
     } catch (Exception e) {
       throw new RuntimeException("Should never be here", e);
     }
+  }
+  
+  @Override
+  public ByteMap<byte[]> getTagUids() {
+    return Tags.getTagUids(key);
   }
   
   public Deferred<Map<String, String>> getTagsAsync() {
@@ -304,6 +315,11 @@ final class RowSeq implements DataPoints {
   public Deferred<List<String>> getAggregatedTagsAsync() {
     final List<String> empty = Collections.emptyList();
     return Deferred.fromResult(empty);
+  }
+  
+  @Override
+  public List<byte[]> getAggregatedTagUids() {
+    return Collections.emptyList();
   }
   
   public List<String> getTSUIDs() {
@@ -347,16 +363,21 @@ final class RowSeq implements DataPoints {
   public SeekableView iterator() {
     return internalIterator();
   }
-
-  /** Package private iterator method to access it as a {@link Iterator}. */
-  Iterator internalIterator() {
+  
+  @Override
+  public Iterator internalIterator() {
     // XXX this is now grossly inefficient, need to walk the arrays once.
     return new Iterator();
   }
 
-  /** Extracts the base timestamp from the row key. */
-  long baseTime() {
-    return Bytes.getUnsignedInt(key, tsdb.metrics.width());
+  @Override
+  public long baseTime() {
+    return Bytes.getUnsignedInt(key, Const.SALT_WIDTH() + tsdb.metrics.width());
+  }
+  
+  @Override
+  public byte[] key() {
+    return key;
   }
 
   /** @throws IndexOutOfBoundsException if {@code i} is out of bounds. */
@@ -493,8 +514,8 @@ final class RowSeq implements DataPoints {
    * on the {@code RowSeq#baseTime()}
    * @since 2.0
    */
-  public static final class RowSeqComparator implements Comparator<RowSeq> {
-    public int compare(final RowSeq a, final RowSeq b) {
+  public static final class RowSeqComparator implements Comparator<iRowSeq> {
+    public int compare(final iRowSeq a, final iRowSeq b) {
       if (a.baseTime() == b.baseTime()) {
         return 0;
       }
@@ -503,7 +524,7 @@ final class RowSeq implements DataPoints {
   }
   
   /** Iterator for {@link RowSeq}s.  */
-  final class Iterator implements SeekableView, DataPoint {
+  final class Iterator implements iRowSeq.Iterator {
 
     /** Current qualifier.  */
     private int qualifier;
@@ -656,5 +677,23 @@ final class RowSeq implements DataPoints {
       return toStringSummary() + ", seq=" + RowSeq.this + ')';
     }
 
+    @Override
+    public long valueCount() {
+      return 1;
+    }
+
+  }
+
+  public int getQueryIndex() {
+    throw new UnsupportedOperationException("Not mapped to a query");
+  }
+  @Override
+  public boolean isPercentile() {
+    return false;
+  }
+
+  @Override
+  public float getPercentile() {
+    throw new UnsupportedOperationException("getPercentile not supported");
   }
 }

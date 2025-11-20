@@ -1,5 +1,5 @@
 // This file is part of OpenTSDB.
-// Copyright (C) 2012  The OpenTSDB Authors.
+// Copyright (C) 2012-2016  The OpenTSDB Authors.
 //
 // This program is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by
@@ -12,6 +12,10 @@
 // see <http://www.gnu.org/licenses/>.
 package net.opentsdb.core;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
 import java.util.Random;
 
 import org.junit.Assert;
@@ -22,7 +26,6 @@ public final class TestAggregators {
   private static final Random random;
   static {
     final long seed = System.nanoTime();
-    System.out.println("Random seed: " + seed);
     random = new Random(seed);
   }
 
@@ -37,26 +40,37 @@ public final class TestAggregators {
 
   /** Helper class to hold a bunch of numbers we can iterate on.  */
   private static final class Numbers implements Aggregator.Longs, Aggregator.Doubles {
-    private final long[] numbers;
+    private final long[] longs;
+    private final double[] doubles;
     private int i = 0;
 
     public Numbers(final long[] numbers) {
-      this.numbers = numbers;
+      longs = numbers;
+      doubles = null;
+    }
+    
+    public Numbers(final double[] numbers) {
+      longs = null;
+      doubles = numbers;
     }
 
+    public boolean isInteger() {
+      return longs != null ? true : false;
+    }
+    
     @Override
     public boolean hasNextValue() {
-      return i < numbers.length;
+      return longs != null ? i < longs.length : i < doubles.length; 
     }
 
     @Override
     public long nextLongValue() {
-      return numbers[i++];
+      return longs[i++];
     }
 
     @Override
     public double nextDoubleValue() {
-      return numbers[i++];
+      return doubles[i++];
     }
 
     void reset() {
@@ -113,9 +127,6 @@ public final class TestAggregators {
                                          final double epsilon) {
     final Numbers numbers = new Numbers(values);
     final Aggregator agg = Aggregators.get("dev");
-
-    Assert.assertEquals(expected, agg.runDouble(numbers), epsilon);
-    numbers.reset();
     Assert.assertEquals(expected, agg.runLong(numbers), Math.max(epsilon, 1.0));
   }
 
@@ -134,4 +145,141 @@ public final class TestAggregators {
     return Math.sqrt(variance);
   }
 
+  @Test
+  public void testPercentiles() {
+    final long[] longValues = new long[1000];
+    for (int i = 0; i < longValues.length; i++) {
+      longValues[i] = i+1;
+    }
+
+    Numbers values = new Numbers(longValues);
+    assertAggregatorEquals(500, Aggregators.get("p50"), values);
+    assertAggregatorEquals(750, Aggregators.get("p75"), values);
+    assertAggregatorEquals(900, Aggregators.get("p90"), values);
+    assertAggregatorEquals(950, Aggregators.get("p95"), values);
+    assertAggregatorEquals(990, Aggregators.get("p99"), values);
+    assertAggregatorEquals(999, Aggregators.get("p999"), values);
+
+    assertAggregatorEquals(500, Aggregators.get("ep50r3"), values);
+    assertAggregatorEquals(750, Aggregators.get("ep75r3"), values);
+    assertAggregatorEquals(900, Aggregators.get("ep90r3"), values);
+    assertAggregatorEquals(950, Aggregators.get("ep95r3"), values);
+    assertAggregatorEquals(990, Aggregators.get("ep99r3"), values);
+    assertAggregatorEquals(999, Aggregators.get("ep999r3"), values);
+    
+    assertAggregatorEquals(500, Aggregators.get("ep50r7"), values);
+    assertAggregatorEquals(750, Aggregators.get("ep75r7"), values);
+    assertAggregatorEquals(900, Aggregators.get("ep90r7"), values);
+    assertAggregatorEquals(950, Aggregators.get("ep95r7"), values);
+    assertAggregatorEquals(990, Aggregators.get("ep99r7"), values);
+    assertAggregatorEquals(999, Aggregators.get("ep999r7"), values);
+  }
+
+  @Test
+  public void testFirst() {
+    final long[] values = new long[10];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = i;
+    }
+    
+    Aggregator agg = Aggregators.FIRST;
+    Numbers numbers = new Numbers(values);
+    assertEquals(0, agg.runLong(numbers));
+    
+    final double[] doubles = new double[10];
+    double val = 0.5;
+    for (int i = 0; i < doubles.length; i++) {
+      doubles[i] = val++;
+    }
+    
+    numbers = new Numbers(doubles);
+    assertEquals(0.5, agg.runDouble(numbers), EPSILON_PERCENTAGE);
+  }
+  
+  @Test
+  public void testLast() {
+    final long[] values = new long[10];
+    for (int i = 0; i < values.length; i++) {
+      values[i] = i;
+    }
+    
+    Aggregator agg = Aggregators.LAST;
+    Numbers numbers = new Numbers(values);
+    assertEquals(9, agg.runLong(numbers));
+    
+    final double[] doubles = new double[10];
+    double val = 0.5;
+    for (int i = 0; i < doubles.length; i++) {
+      doubles[i] = val++;
+    }
+    
+    numbers = new Numbers(doubles);
+    assertEquals(9.5, agg.runDouble(numbers), EPSILON_PERCENTAGE);
+  }
+  
+  @Test
+  public void testMedian() {
+    final Aggregator agg = Aggregators.get("median");
+    Numbers numbers = new Numbers(new long[] { 5, 2, -1, 400, 3 });
+    assertEquals(3, agg.runLong(numbers));
+    
+    numbers = new Numbers(new long[] { 5, 2, -1, 400, 3, -42 });
+    assertEquals(3, agg.runLong(numbers));
+    
+    numbers = new Numbers(new long[] { 42 });
+    assertEquals(42, agg.runLong(numbers));
+    
+    numbers = new Numbers(new long[] { });
+    try {
+      assertEquals(42, agg.runLong(numbers));
+      fail("Expected IllegalStateException");
+    } catch (IllegalStateException e) { }
+    
+    numbers = new Numbers(new double[] { 5.1, 2.434, -1.99, 400.69487, 3.15168 });
+    assertEquals(3.15168, agg.runDouble(numbers), 0.0001);
+    
+    numbers = new Numbers(new double[] { 5.1, 2.434, -1.99, 400.69487, 
+        3.15168, -42 });
+    assertEquals(3.15168, agg.runDouble(numbers), 0.0001);
+    
+    numbers = new Numbers(new double[] { 42.5 });
+    assertEquals(42.5, agg.runDouble(numbers), 0.0001);
+    
+    numbers = new Numbers(new double[] { });
+    assertTrue(Double.isNaN(agg.runDouble(numbers)));
+  }
+  
+  private void assertAggregatorEquals(long value, Aggregator agg, Numbers numbers) {
+    if (numbers.isInteger()) {
+      Assert.assertEquals(value, agg.runLong(numbers));
+    } else {
+      Assert.assertEquals((double)value, agg.runDouble(numbers), 1.0);
+    }
+    numbers.reset();
+  }
+
+  @Test
+  public void testSquareSumFewDataInputs(){
+    final long[] longValues = new long[2];
+    for (int i = 0; i < longValues.length; i++) {
+      longValues[i] = i + 1;
+    }
+
+    Numbers values = new Numbers(longValues);
+    assertAggregatorEquals(5, net.opentsdb.core.Aggregators.get("squareSum"), values);
+  }
+
+  @Test
+  public void testSquareSumRandomInputs(){
+    final long[] longValues = new long[100];
+    long summ = 0;
+    for (int i = 0; i < longValues.length; i++) {
+      long temp = random.nextLong();
+      longValues[i] = temp;
+      summ += temp * temp;
+    }
+
+    Numbers values = new Numbers(longValues);
+    assertAggregatorEquals(summ, net.opentsdb.core.Aggregators.get("squareSum"), values);
+  }
 }

@@ -16,7 +16,15 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TimeZone;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.google.common.base.Objects;
+import com.stumbleupon.async.Callback;
+import com.stumbleupon.async.Deferred;
+
+import net.opentsdb.stats.QueryStats;
 import net.opentsdb.utils.DateTime;
 
 /**
@@ -32,6 +40,7 @@ import net.opentsdb.utils.DateTime;
  * {@code start_time} and {@code end_time} fields.
  * @since 2.0
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 public final class TSQuery {
 
   /** User given start date/time, could be relative or absolute */
@@ -62,7 +71,7 @@ public final class TSQuery {
   private boolean show_tsuids;
   
   /** A list of parsed sub queries, must have one or more to fetch data */
-  private ArrayList<TSSubQuery> queries;
+  private List<TSSubQuery> queries;
 
   /** The parsed start time value 
    * <b>Do not set directly</b> */
@@ -75,11 +84,74 @@ public final class TSQuery {
   /** Whether or not the user wasn't millisecond resolution */
   private boolean ms_resolution;
   
+  /** Whether or not to show the sub query with the results */
+  private boolean show_query;
+  
+  /** Whether or not to include stats in the output */
+  private boolean show_stats;
+  
+  /** Whether or not to include stats summary in the output */
+  private boolean show_summary;
+  
+  /** Whether or not to delete the queried data */
+  private boolean delete = false;
+  
+  /** A flag denoting whether or not to align intervals based on the calendar */
+  private boolean use_calendar;
+  
+  /** The query status for tracking over all performance of this query */
+  private QueryStats query_stats;
+  
+  /** Override default max byte limit */
+  private boolean override_byte_limit;
+  
+  /** Override default max row count limit */
+  private boolean override_data_point_limit;
+  
   /**
    * Default constructor necessary for POJO de/serialization
    */
   public TSQuery() {
     
+  }
+  
+  @Override
+  public int hashCode() {
+    // NOTE: Do not add any non-user submitted variables to the hash. We don't
+    // want the hash to change after validation.
+    // We also don't care about stats or summary
+    return Objects.hashCode(start, end, timezone, use_calendar, options, padding, 
+        no_annotations, with_global_annotations, show_tsuids, queries, 
+        ms_resolution);
+  }
+  
+  @Override
+  public boolean equals(final Object obj) {
+    if (obj == null) {
+      return false;
+    }
+    if (!(obj instanceof TSQuery)) {
+      return false;
+    }
+    if (obj == this) {
+      return true;
+    }
+    
+    // NOTE: Do not add any non-user submitted variables to the comparator. We 
+    // don't want the value to change after validation.
+    // We also don't care about stats or summary
+    final TSQuery query = (TSQuery)obj;
+    return Objects.equal(start, query.start)
+        && Objects.equal(end, query.end)
+        && Objects.equal(timezone, query.timezone)
+        && Objects.equal(use_calendar,query.use_calendar)
+        && Objects.equal(options, query.options)
+        && Objects.equal(padding, query.padding)
+        && Objects.equal(no_annotations, query.no_annotations)
+        && Objects.equal(with_global_annotations, query.with_global_annotations)
+        && Objects.equal(show_tsuids, query.show_tsuids)
+        && Objects.equal(queries, query.queries)
+        && Objects.equal(ms_resolution, query.ms_resolution);
   }
   
   /**
@@ -104,9 +176,9 @@ public final class TSQuery {
     } else {
       end_time = System.currentTimeMillis();
     }
-    if (end_time <= start_time) {
+    if (end_time < start_time) {
       throw new IllegalArgumentException(
-          "End time [" + end_time + "] must be greater than the start time ["
+          "End time [" + end_time + "] must be greater than or equal to the start time ["
           + start_time +"]");
     }
     
@@ -115,8 +187,25 @@ public final class TSQuery {
     }
     
     // validate queries
+    int i = 0;
     for (TSSubQuery sub : queries) {
       sub.validateAndSetQuery();
+      final DownsamplingSpecification ds = sub.downsamplingSpecification();
+      if (ds != null && timezone != null && !timezone.isEmpty() && 
+          ds != DownsamplingSpecification.NO_DOWNSAMPLER) {
+        final TimeZone tz = DateTime.timezones.get(timezone);
+        if (tz == null) {
+          throw new IllegalArgumentException(
+              "The timezone specification could not be found");
+        }
+        ds.setTimezone(tz);
+      }
+      if (ds != null && use_calendar && 
+          ds != DownsamplingSpecification.NO_DOWNSAMPLER) {
+        ds.setUseCalendar(true);
+      }
+      
+      sub.setIndex(i++);
     }
   }
   
@@ -129,37 +218,52 @@ public final class TSQuery {
    * @return An array of queries
    */
   public Query[] buildQueries(final TSDB tsdb) {
-    final Query[] queries = new Query[this.queries.size()];
-    int i = 0;
-    for (TSSubQuery sub : this.queries) {
-      final Query query = tsdb.newQuery();
-      query.setStartTime(start_time);
-      query.setEndTime(end_time);
-      if (sub.downsampler() != null) {
-        query.downsample(sub.downsampleInterval(), sub.downsampler());
-      } else if (!ms_resolution) {
-        // we *may* have multiple millisecond data points in the set so we have
-        // to downsample. use the sub query's aggregator
-        query.downsample(1000, sub.aggregator());
-      }
-      if (sub.getTsuids() != null && !sub.getTsuids().isEmpty()) {
-        if (sub.getRateOptions() != null) {
-          query.setTimeSeries(sub.getTsuids(), sub.aggregator(), sub.getRate(), 
-              sub.getRateOptions());
-        } else {
-          query.setTimeSeries(sub.getTsuids(), sub.aggregator(), sub.getRate());
-        }
-      } else if (sub.getRateOptions() != null) {
-        query.setTimeSeries(sub.getMetric(), sub.getTags(), sub.aggregator(), 
-            sub.getRate(), sub.getRateOptions());
-      } else {
-        query.setTimeSeries(sub.getMetric(), sub.getTags(), sub.aggregator(), 
-            sub.getRate());
-      }
-      queries[i] = query;
-      i++;
+    try {
+      return buildQueriesAsync(tsdb).joinUninterruptibly();
+    } catch (final Exception e) {
+      throw new RuntimeException("Unexpected exception", e);
     }
-    return queries;
+  }
+  
+  /**
+   * Compiles the TSQuery into an array of Query objects for execution.
+   * If the user has not set a down sampler explicitly, and they don't want 
+   * millisecond resolution, then we set the down sampler to 1 second to handle
+   * situations where storage may have multiple data points per second.
+   * @param tsdb The tsdb to use for {@link TSDB#newQuery}
+   * @return A deferred array of queries to wait on for compilation.
+   * @since 2.2
+   */
+  public Deferred<Query[]> buildQueriesAsync(final TSDB tsdb) {
+    final Query[] tsdb_queries = new Query[queries.size()];
+    
+    final List<Deferred<Object>> deferreds =
+        new ArrayList<Deferred<Object>>(queries.size());
+    for (int i = 0; i < queries.size(); i++) {
+      Query query = tsdb.newQuery();
+      Deferred<Object> resolution = query.configureFromQuery(this, i);
+
+      if (query.needsSplitting() && (query instanceof TsdbQuery)) {
+        query = new SplitRollupQuery(tsdb, (TsdbQuery) query, resolution);
+        resolution = query.configureFromQuery(this, i);
+      }
+      deferreds.add(resolution);
+
+      tsdb_queries[i] = query;
+    }
+    
+    class GroupFinished implements Callback<Query[], ArrayList<Object>> {
+      @Override
+      public Query[] call(final ArrayList<Object> deferreds) {
+        return tsdb_queries;
+      }
+      @Override
+      public String toString() {
+        return "Query compile group callback";
+      }
+    }
+    
+    return Deferred.group(deferreds).addCallback(new GroupFinished());
   }
   
   public String toString() {
@@ -271,6 +375,39 @@ public final class TSQuery {
     return ms_resolution;
   }
   
+  /** @return whether or not to show the query with the results */
+  public boolean getShowQuery() {
+    return show_query;
+  }
+  
+  /** @return whether or not to return stats per query */
+  public boolean getShowStats() {
+    return show_stats;
+  }
+  
+  /** @return Whether or not to show the query summary */
+  public boolean getShowSummary() {
+    return this.show_summary;
+  }
+  
+  /** @return Whether or not to delete the queried data @since 2.2 */
+  public boolean getDelete() {
+    return this.delete;
+  }
+  
+  /** @return the flag denoting whether intervals should be aligned based on 
+   * the calendar
+   * @since 2.3 */
+  public boolean getUseCalendar() {
+    return use_calendar;
+  }
+  
+  /** @return the query stats object. Ignored during JSON serialization */
+  @JsonIgnore
+  public QueryStats getQueryStats() {
+    return query_stats;
+  }
+  
   /**
    * Sets the start time for further parsing. This can be an absolute or 
    * relative value. See {@link DateTime#parseDateTimeString} for details.
@@ -321,7 +458,7 @@ public final class TSQuery {
   }
   
   /** @param queries a list of {@link TSSubQuery} objects to store*/
-  public void setQueries(ArrayList<TSSubQuery> queries) {
+  public void setQueries(final List<TSSubQuery> queries) {
     this.queries = queries;
   }
 
@@ -329,4 +466,58 @@ public final class TSQuery {
   public void setMsResolution(boolean ms_resolution) {
     this.ms_resolution = ms_resolution;
   }
+
+  /** @param show_query whether or not to show the query with the serialization */
+  public void setShowQuery(boolean show_query) { 
+    this.show_query = show_query;
+  }
+  
+  /** @param show_stats whether or not to show stats in the serialization */
+  public void setShowStats(boolean show_stats) { 
+    this.show_stats = show_stats;
+  }
+
+  /** @param show_summary whether or not to show the query summary */
+  public void setShowSummary(boolean show_summary) { 
+    this.show_summary = show_summary;
+  }
+
+  /** @param delete whether or not to delete the queried data @since 2.2 */
+  public void setDelete(boolean delete) {
+    this.delete = delete;
+  }
+  
+  /** @param use_calendar a flag denoting whether or not to align intervals 
+   * based on the calendar @since 2.3 */
+  public void setUseCalendar(boolean use_calendar) {
+    this.use_calendar = use_calendar;
+  }
+  
+  /** @param query_stats the query stats object to associate with this query */
+  public void setQueryStats(final QueryStats query_stats) {
+    this.query_stats = query_stats;
+  }
+
+  /** @return Whether or not the query would like to override the byte limiter. */
+  public boolean overrideByteLimit() {
+    return override_byte_limit;
+  }
+
+  /** @param override_byte_limit Whether or not the query would like to override 
+   * the byte limiter. */
+  public void setOverrideByteLimit(boolean override_byte_limit) {
+    this.override_byte_limit = override_byte_limit;
+  }
+
+  /** @return Whether or not the query would like to override the data point limit. */
+  public boolean overrideDataPointLimit() {
+    return override_data_point_limit;
+  }
+
+  /** @param override_data_point_limit Whether or not the query would like to 
+   * override the data point limit. */
+  public void setOverrideDataPointLimit(boolean override_data_point_limit) {
+    this.override_data_point_limit = override_data_point_limit;
+  }
+
 }

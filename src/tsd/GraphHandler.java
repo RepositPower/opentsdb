@@ -1,5 +1,5 @@
 // This file is part of OpenTSDB.
-// Copyright (C) 2010-2012  The OpenTSDB Authors.
+// Copyright (C) 2010-2021  The OpenTSDB Authors.
 //
 // This program is free software: you can redistribute it and/or modify it
 // under the terms of the GNU Lesser General Public License as published by
@@ -19,39 +19,50 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.net.URL;
+import java.net.URLDecoder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.NoSuchElementException;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
+
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import com.fasterxml.jackson.core.JsonParseException;
 import com.fasterxml.jackson.databind.JsonMappingException;
+import com.google.common.base.Strings;
+import com.google.common.collect.Sets;
+
+import org.jboss.netty.handler.codec.http.HttpMethod;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import net.opentsdb.core.Aggregator;
-import net.opentsdb.core.Aggregators;
 import net.opentsdb.core.Const;
 import net.opentsdb.core.DataPoint;
 import net.opentsdb.core.DataPoints;
 import net.opentsdb.core.Query;
-import net.opentsdb.core.RateOptions;
 import net.opentsdb.core.TSDB;
+import net.opentsdb.core.TSQuery;
 import net.opentsdb.core.Tags;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import net.opentsdb.graph.Plot;
+import net.opentsdb.meta.Annotation;
 import net.opentsdb.stats.Histogram;
 import net.opentsdb.stats.StatsCollector;
-import net.opentsdb.uid.NoSuchUniqueName;
+import net.opentsdb.tools.GnuplotInstaller;
 import net.opentsdb.utils.DateTime;
 import net.opentsdb.utils.JSON;
+
+import com.stumbleupon.async.Callback;
 
 /**
  * Stateless handler of HTTP graph requests (the {@code /q} endpoint).
@@ -64,6 +75,18 @@ final class GraphHandler implements HttpRpc {
   private static final boolean IS_WINDOWS =
     System.getProperty("os.name", "").contains("Windows");
 
+  private static final String RANGE_COMPONENT = "\\\"?-?\\d*\\.?(\\d+)?([eE]-?\\d+)?\\\"?";
+  private static Pattern RANGE_VALIDATOR = Pattern.compile(
+      "^\\["+RANGE_COMPONENT+":"+RANGE_COMPONENT+"]$");
+  private static Pattern LABEL_VALIDATOR = Pattern.compile("^[a-zA-z0-9 \\-_]+$");
+  private static Pattern KEY_VALIDATOR = Pattern.compile(
+      "^out|left|top|center|right|horiz|box|bottom$");
+  private static Pattern STYLE_VALIDATOR = Pattern.compile("^linespoint|points|circles|dots$");
+  private static Pattern COLOR_VALIDATOR = Pattern.compile("^(x|X)[a-fA-F0-9]{6}$");
+  private static Pattern SMOOTH_VALIDATOR = Pattern.compile("^unique|frequency|fnormal|cumulative|cnormal|bins|csplines|acsplines|mcsplines|bezier|sbezier|unwrap|zsort$");
+  // NOTE: This one should be tightened for only time based formatters.
+  private static Pattern FORMAT_VALIDATOR = Pattern.compile("^[%0-9.a-zA-Z \\-]+$");
+  private static Pattern WXH_VALIDATOR = Pattern.compile("^\\d+x\\d+$");
   /** Number of times we had to do all the work up to running Gnuplot. */
   private static final AtomicInteger graphs_generated
     = new AtomicInteger();
@@ -105,6 +128,10 @@ final class GraphHandler implements HttpRpc {
   }
 
   public void execute(final TSDB tsdb, final HttpQuery query) {
+
+    // only accept GET/POST
+    RpcUtil.allowedMethods(query.method(), HttpMethod.GET.getName(), HttpMethod.POST.getName());
+
     if (!query.hasQueryStringParam("json")
         && !query.hasQueryStringParam("png")
         && !query.hasQueryStringParam("ascii")) {
@@ -126,6 +153,10 @@ final class GraphHandler implements HttpRpc {
     }
   }
 
+  // TODO(HugoMFernandes): Most of this (query-related) logic is implemented in
+  // net.opentsdb.tsd.QueryRpc.java (which actually does this asynchronously),
+  // so we should refactor both classes to split the actual logic used to
+  // generate the data from the actual visualization (removing all duped code).
   private void doGraph(final TSDB tsdb, final HttpQuery query)
     throws IOException {
     final String basepath = getGnuplotBasePath(tsdb, query);
@@ -157,10 +188,39 @@ final class GraphHandler implements HttpRpc {
     if (!nocache && isDiskCacheHit(query, end_time, max_age, basepath)) {
       return;
     }
-    Query[] tsdbqueries;
-    List<String> options;
-    tsdbqueries = parseQuery(tsdb, query);
-    options = query.getQueryStringParams("o");
+
+    // Parse TSQuery from HTTP query
+    final TSQuery tsquery = QueryRpc.parseQuery(tsdb, query);
+    tsquery.validateAndSetQuery();
+
+    // Build the queries for the parsed TSQuery
+    Query[] tsdbqueries = tsquery.buildQueries(tsdb);
+
+    List<String> options = null;
+    final String options_allow_list = tsdb.getConfig().getString(
+        "tsd.gnuplot.options.allowlist");
+    if (!Strings.isNullOrEmpty(options_allow_list)) {
+      String[] allow_list_strings = options_allow_list.split(";");
+      Set<String> allow_list = Sets.newHashSet();
+      for (int i = 0; i < allow_list_strings.length; i++) {
+        String allow = allow_list_strings[i];
+        if (allow != null) {
+          allow = URLDecoder.decode(allow.trim());
+          allow_list.add(allow);
+        }
+      }
+
+      options = query.getQueryStringParams("o");
+      if (!(options == null)) {
+        for (int i = 0; i < options.size(); i++) {
+          if (!allow_list.contains(options.get(i))) {
+            throw new BadRequestException("Query option at index " + i
+                + " was not in the allow list.");
+          }
+        }
+      }
+    }
+
     if (options == null) {
       options = new ArrayList<String>(tsdbqueries.length);
       for (int i = 0; i < tsdbqueries.length; i++) {
@@ -215,9 +275,37 @@ final class GraphHandler implements HttpRpc {
       return;
     }
 
+    final RunGnuplot rungnuplot = new RunGnuplot(query, max_age, plot, basepath,
+            aggregated_tags, npoints);
+
+    class ErrorCB implements Callback<Object, Exception> {
+      public Object call(final Exception e) throws Exception {
+        LOG.warn("Failed to retrieve global annotations: ", e);
+        throw e;
+      }
+    }
+
+    class GlobalCB implements Callback<Object, List<Annotation>> {
+      public Object call(final List<Annotation> global_annotations) throws Exception {
+        rungnuplot.plot.setGlobals(global_annotations);
+        execGnuplot(rungnuplot, query);
+
+        return null;
+      }
+    }
+
+    // Fetch global annotations, if needed
+    if (!tsquery.getNoAnnotations() && tsquery.getGlobalAnnotations()) {
+      Annotation.getGlobalAnnotations(tsdb, start_time, end_time)
+              .addCallback(new GlobalCB()).addErrback(new ErrorCB());
+    } else {
+      execGnuplot(rungnuplot, query);
+    }
+  }
+
+  private void execGnuplot(RunGnuplot rungnuplot, HttpQuery query) {
     try {
-      gnuplot.execute(new RunGnuplot(query, max_age, plot, basepath,
-                                     aggregated_tags, npoints));
+      gnuplot.execute(rungnuplot);
     } catch (RejectedExecutionException e) {
       query.internalError(new Exception("Too many requests pending,"
                                         + " please try again later", e));
@@ -357,7 +445,7 @@ final class GraphHandler implements HttpRpc {
     qs.remove("png");
     qs.remove("json");
     qs.remove("ascii");
-    return tsdb.getConfig().getDirectoryName("tsd.http.cachedir") + 
+    return tsdb.getConfig().getDirectoryName("tsd.http.cachedir") +
         Integer.toHexString(qs.hashCode());
   }
 
@@ -587,8 +675,14 @@ final class GraphHandler implements HttpRpc {
 
   /** Parses the {@code wxh} query parameter to set the graph dimension. */
   static void setPlotDimensions(final HttpQuery query, final Plot plot) {
-    final String wxh = query.getQueryStringParam("wxh");
+    String wxh = query.getQueryStringParam("wxh");
     if (wxh != null && !wxh.isEmpty()) {
+      wxh = URLDecoder.decode(wxh.trim());
+      validateString("wxh", wxh);
+      if (!WXH_VALIDATOR.matcher(wxh).find()) {
+        throw new IllegalArgumentException("'wxh' was invalid. "
+            + "Must satisfy the pattern " + WXH_VALIDATOR.toString());
+      }
       final int wxhlength = wxh.length();
       if (wxhlength < 7) {  // 100x100 minimum.
         throw new BadRequestException("Parameter wxh too short: " + wxh);
@@ -633,13 +727,23 @@ final class GraphHandler implements HttpRpc {
    * @return {@code null} if the parameter wasn't passed, otherwise the
    * value of the last occurrence of the parameter.
    */
-  private static String popParam(final Map<String, List<String>> querystring,
-                                     final String param) {
+  public static String popParam(final Map<String, List<String>> querystring,
+                                final String param) {
     final List<String> params = querystring.remove(param);
     if (params == null) {
       return null;
     }
-    return params.get(params.size() - 1);
+    String given = params.get(params.size() - 1);
+    if (given != null) {
+      given = URLDecoder.decode(given.trim());
+    }
+    // TODO - far from perfect, should help a little.
+    if (given.contains("`") || given.contains("%60") || 
+        given.contains("&#96;")) {
+      throw new BadRequestException("Parameter " + param + " contained a "
+          + "back-tick. That's a no-no.");
+    }
+    return given;
   }
 
   /**
@@ -652,24 +756,59 @@ final class GraphHandler implements HttpRpc {
     final Map<String, List<String>> querystring = query.getQueryString();
     String value;
     if ((value = popParam(querystring, "yrange")) != null) {
+      validateString("yrange", value, "[:]");
+      if (!RANGE_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'yrange' was invalid. "
+            + "Must be in the format [min:max].");
+      }
       params.put("yrange", value);
     }
     if ((value = popParam(querystring, "y2range")) != null) {
+      validateString("y2range", value, "[:]");
+      if (!RANGE_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'y2range' was invalid. "
+            + "Must be in the format [min:max].");
+      }
       params.put("y2range", value);
     }
     if ((value = popParam(querystring, "ylabel")) != null) {
+      validateString("ylabel", value, " ");
+      if (!LABEL_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'ylabel' was invalid. Must "
+            + "satisfy the pattern " + LABEL_VALIDATOR.toString());
+      }
       params.put("ylabel", stringify(value));
     }
     if ((value = popParam(querystring, "y2label")) != null) {
+      validateString("y2label", value, " ");
+      if (!LABEL_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'y2label' was invalid. Must "
+            + "satisfy the pattern " + LABEL_VALIDATOR.toString());
+      }
       params.put("y2label", stringify(value));
     }
     if ((value = popParam(querystring, "yformat")) != null) {
+      validateString("yformat", value, "% ");
+      if (!FORMAT_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'yformat' was invalid. Must "
+            + "satisfy the pattern " + FORMAT_VALIDATOR.toString());
+      }
       params.put("format y", stringify(value));
     }
     if ((value = popParam(querystring, "y2format")) != null) {
+      validateString("y2format", value, "% ");
+      if (!FORMAT_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'y2format' was invalid. Must "
+            + "satisfy the pattern " + FORMAT_VALIDATOR.toString());
+      }
       params.put("format y2", stringify(value));
     }
     if ((value = popParam(querystring, "xformat")) != null) {
+      validateString("xformat", value, "% ");
+      if (!FORMAT_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'xformat' was invalid. Must "
+            + "satisfy the pattern " + FORMAT_VALIDATOR.toString());
+      }
       params.put("format x", stringify(value));
     }
     if ((value = popParam(querystring, "ylog")) != null) {
@@ -679,19 +818,52 @@ final class GraphHandler implements HttpRpc {
       params.put("logscale y2", "");
     }
     if ((value = popParam(querystring, "key")) != null) {
+      validateString("key", value);
+      if (!KEY_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'key' was invalid. Must "
+            + "satisfy the pattern " + KEY_VALIDATOR.toString());
+      }
       params.put("key", value);
     }
     if ((value = popParam(querystring, "title")) != null) {
+      validateString("title", value, " ");
+      if (!LABEL_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'title' was invalid. Must "
+            + "satisfy the pattern " + LABEL_VALIDATOR.toString());
+      }
       params.put("title", stringify(value));
     }
     if ((value = popParam(querystring, "bgcolor")) != null) {
+      validateString("bgcolor", value);
+      if (!COLOR_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'bgcolor' was invalid. Must "
+            + "be a hex value e.g. 'xFFFFFF'");
+      }
       params.put("bgcolor", value);
     }
     if ((value = popParam(querystring, "fgcolor")) != null) {
+      validateString("fgcolor", value);
+      if (!COLOR_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'fgcolor' was invalid. Must "
+            + "be a hex value e.g. 'xFFFFFF'");
+      }
       params.put("fgcolor", value);
     }
     if ((value = popParam(querystring, "smooth")) != null) {
+      validateString("smooth", value);
+      if (!SMOOTH_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'smooth' was invalid. Must "
+            + "satisfy the pattern " + SMOOTH_VALIDATOR.toString());
+      }
       params.put("smooth", value);
+    }
+    if ((value = popParam(querystring, "style")) != null) {
+      validateString("style", value);
+      if (!STYLE_VALIDATOR.matcher(value).find()) {
+        throw new BadRequestException("'style' was invalid. Must "
+            + "satisfy the pattern " + STYLE_VALIDATOR.toString());
+      }
+      params.put("style", value);
     }
     // This must remain after the previous `if' in order to properly override
     // any previous `key' parameter if a `nokey' parameter is given.
@@ -793,20 +965,27 @@ final class GraphHandler implements HttpRpc {
             .append('=').append(tag.getValue());
         }
         for (final DataPoint d : dp) {
-          asciifile.print(metric);
-          asciifile.print(' ');
-          asciifile.print((d.timestamp() / 1000));
-          asciifile.print(' ');
           if (d.isInteger()) {
+            printMetricHeader(asciifile, metric, d.timestamp());
             asciifile.print(d.longValue());
           } else {
+            // Doubles require extra processing.
             final double value = d.doubleValue();
-            if (value != value || Double.isInfinite(value)) {
-              throw new IllegalStateException("NaN or Infinity:" + value
+
+            // Value might be NaN or infinity.
+            if (Double.isInfinite(value)) {
+              // Infinity is invalid.
+              throw new IllegalStateException("Infinity:" + value
                 + " d=" + d + ", query=" + query);
+            } else if (Double.isNaN(value)) {
+              // NaNs should be skipped.
+              continue;
             }
+
+            printMetricHeader(asciifile, metric, d.timestamp());
             asciifile.print(value);
           }
+
           asciifile.print(tagbuf);
           asciifile.print('\n');
         }
@@ -822,81 +1001,17 @@ final class GraphHandler implements HttpRpc {
   }
 
   /**
-   * Parses the {@code /q} query in a list of {@link Query} objects.
-   * @param tsdb The TSDB to use.
-   * @param query The HTTP query for {@code /q}.
-   * @return The corresponding {@link Query} objects.
-   * @throws BadRequestException if the query was malformed.
-   * @throws IllegalArgumentException if the metric or tags were malformed.
+   * Helper method to write metric name and timestamp.
+   * @param writer The writer to which to write.
+   * @param metric The metric name.
+   * @param timestamp The timestamp.
    */
-  private static Query[] parseQuery(final TSDB tsdb, final HttpQuery query) {
-    final List<String> ms = query.getQueryStringParams("m");
-    if (ms == null) {
-      throw BadRequestException.missingParameter("m");
-    }
-    final Query[] tsdbqueries = new Query[ms.size()];
-    int nqueries = 0;
-    for (final String m : ms) {
-      // m is of the following forms:
-      //   agg:[interval-agg:][rate[{counter[,[countermax][,resetvalue]]}]:]
-      //     metric[{tag=value,...}]
-      // Where the parts in square brackets `[' .. `]' are optional.
-      final String[] parts = Tags.splitString(m, ':');
-      int i = parts.length;
-      if (i < 2 || i > 4) {
-        throw new BadRequestException("Invalid parameter m=" + m + " ("
-          + (i < 2 ? "not enough" : "too many") + " :-separated parts)");
-      }
-      final Aggregator agg = getAggregator(parts[0]);
-      i--;  // Move to the last part (the metric name).
-      final HashMap<String, String> parsedtags = new HashMap<String, String>();
-      final String metric = Tags.parseWithMetric(parts[i], parsedtags);
-      final boolean rate = parts[--i].startsWith("rate");
-      final RateOptions rate_options = QueryRpc.parseRateOptions(rate, parts[i]);
-      if (rate) {
-        i--;  // Move to the next part.
-      }
-      final Query tsdbquery = tsdb.newQuery();
-      try {
-        tsdbquery.setTimeSeries(metric, parsedtags, agg, rate, rate_options);
-      } catch (NoSuchUniqueName e) {
-        throw new BadRequestException(e.getMessage());
-      }
-      // downsampling function & interval.
-      if (i > 0) {
-        final int dash = parts[1].indexOf('-', 1);  // 1st char can't be `-'.
-        if (dash < 0) {
-          throw new BadRequestException("Invalid downsampling specifier '"
-                                        + parts[1] + "' in m=" + m);
-        }
-        Aggregator downsampler;
-        try {
-          downsampler = Aggregators.get(parts[1].substring(dash + 1));
-        } catch (NoSuchElementException e) {
-          throw new BadRequestException("No such downsampling function: "
-                                        + parts[1].substring(dash + 1));
-        }
-        final long interval = DateTime.parseDuration(parts[1].substring(0, dash));
-        tsdbquery.downsample(interval, downsampler);
-      } else {
-        tsdbquery.downsample(1000, agg);
-      }
-      tsdbqueries[nqueries++] = tsdbquery;
-    }
-    return tsdbqueries;
-  }
-
-  /**
-   * Returns the aggregator with the given name.
-   * @param name Name of the aggregator to get.
-   * @throws BadRequestException if there's no aggregator with this name.
-   */
-  private static final Aggregator getAggregator(final String name) {
-    try {
-      return Aggregators.get(name);
-    } catch (NoSuchElementException e) {
-      throw new BadRequestException("No such aggregation function: " + name);
-    }
+  private static void printMetricHeader(final PrintWriter writer, final String metric,
+      final long timestamp) {
+    writer.print(metric);
+    writer.print(' ');
+    writer.print(timestamp / 1000L);
+    writer.print(' ');
   }
 
   private static final PlotThdFactory thread_factory = new PlotThdFactory();
@@ -924,6 +1039,18 @@ final class GraphHandler implements HttpRpc {
    * @return The path to the wrapper script.
    */
   private static String findGnuplotHelperScript() {
+    if(!GnuplotInstaller.FOUND_GP) {
+      LOG.warn("Skipping Gnuplot Shell Script Install since Gnuplot executable was not found");
+      return null;
+    }
+    if(!GnuplotInstaller.GP_FILE.exists()) {
+      GnuplotInstaller.installMyGnuPlot();
+    }
+    if(GnuplotInstaller.GP_FILE.exists() && GnuplotInstaller.GP_FILE.canExecute()) {
+      LOG.info("Auto Installed Gnuplot Invoker at [{}]", GnuplotInstaller.GP_FILE.getAbsolutePath());
+      return GnuplotInstaller.GP_FILE.getAbsolutePath();
+    }
+    
     final URL url = GraphHandler.class.getClassLoader().getResource(WRAPPER);
     if (url == null) {
       throw new RuntimeException("Couldn't find " + WRAPPER + " on the"
@@ -967,6 +1094,28 @@ final class GraphHandler implements HttpRpc {
   static void logError(final HttpQuery query, final String msg,
                        final Throwable e) {
     LOG.error(query.channel().toString() + ' ' + msg, e);
+  }
+
+  static void validateString(final String what, final String s) {
+    validateString(what, s, "");
+  }
+
+  public static void validateString(final String what, final String s, String specials) {
+    if (s == null) {
+      throw new BadRequestException("Invalid " + what + ": null");
+    } else if ("".equals(s)) {
+      throw new BadRequestException("Invalid " + what + ": empty string");
+    }
+    final int n = s.length();
+    for (int i = 0; i < n; i++) {
+      final char c = s.charAt(i);
+      if (!(('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
+          || ('0' <= c && c <= '9') || c == '-' || c == '_' || c == '.'
+          || c == '/' || Character.isLetter(c) || specials.indexOf(c) != -1)) {
+        throw new BadRequestException("Invalid " + what
+            + " (\"" + s + "\"): illegal character: " + c);
+      }
+    }
   }
 
 }

@@ -33,6 +33,7 @@ import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
 
 import net.opentsdb.core.TSDB;
+import net.opentsdb.uid.NoSuchUniqueId;
 import net.opentsdb.uid.UniqueId;
 import net.opentsdb.uid.UniqueId.UniqueIdType;
 import net.opentsdb.utils.JSON;
@@ -282,8 +283,7 @@ public final class Leaf implements Comparable<Leaf> {
     }
   
     // split the TSUID to get the tags
-    final List<byte[]> parsed_tags = UniqueId.getTagPairsFromTSUID(leaf.tsuid, 
-        TSDB.metrics_width(), TSDB.tagk_width(), TSDB.tagv_width());
+    final List<byte[]> parsed_tags = UniqueId.getTagsFromTSUID(leaf.tsuid);
     
     // initialize the with empty objects, otherwise the "set" operations in 
     // the callback won't work.

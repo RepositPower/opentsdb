@@ -13,156 +13,118 @@
 package net.opentsdb.core;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyString;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
-import static org.powermock.api.mockito.PowerMockito.mock;
 
-import java.lang.reflect.Field;
 import java.util.HashMap;
-import java.util.Map;
 
-import com.stumbleupon.async.Deferred;
-
-import net.opentsdb.meta.Annotation;
-import net.opentsdb.storage.MockBase;
-import net.opentsdb.uid.NoSuchUniqueName;
-import net.opentsdb.uid.UniqueId;
-import net.opentsdb.utils.Config;
 import net.opentsdb.utils.DateTime;
 
-import org.apache.zookeeper.proto.DeleteRequest;
-import org.hbase.async.GetRequest;
-import org.hbase.async.HBaseClient;
-import org.hbase.async.KeyValue;
-import org.hbase.async.PutRequest;
 import org.hbase.async.Scanner;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.mockito.invocation.InvocationOnMock;
-import org.mockito.stubbing.Answer;
-import org.powermock.api.mockito.PowerMockito;
-import org.powermock.core.classloader.annotations.PowerMockIgnore;
 import org.powermock.core.classloader.annotations.PrepareForTest;
 import org.powermock.modules.junit4.PowerMockRunner;
+import org.powermock.reflect.Whitebox;
+
+import com.google.common.collect.Lists;
+import com.google.common.math.DoubleMath;
 
 /**
  * Tests downsampling with query.
  */
 @RunWith(PowerMockRunner.class)
-@PowerMockIgnore({"javax.management.*", "javax.xml.*",
-  "ch.qos.*", "org.slf4j.*",
-  "com.sum.*", "org.xml.*"})
-@PrepareForTest({TSDB.class, Config.class, UniqueId.class, HBaseClient.class,
-  CompactionQueue.class, GetRequest.class, PutRequest.class, KeyValue.class,
-  Scanner.class, TsdbQuery.class, DeleteRequest.class, Annotation.class,
-  RowKey.class, Span.class, SpanGroup.class, IncomingDataPoints.class })
-public class TestTsdbQueryDownsample {
-
-  private Config config;
-  private TSDB tsdb = null;
-  private HBaseClient client = mock(HBaseClient.class);
-  private UniqueId metrics = mock(UniqueId.class);
-  private UniqueId tag_names = mock(UniqueId.class);
-  private UniqueId tag_values = mock(UniqueId.class);
-  private TsdbQuery query = null;
-  private MockBase storage = null;
+@PrepareForTest({ Scanner.class })
+public class TestTsdbQueryDownsample extends BaseTsdbTest {
+  protected TsdbQuery query = null;
 
   @Before
-  public void before() throws Exception {
-    config = new Config(false);
-    tsdb = new TSDB(config);
+  public void beforeLocal() throws Exception {
     query = new TsdbQuery(tsdb);
-
-    // replace the "real" field objects with mocks
-    Field cl = tsdb.getClass().getDeclaredField("client");
-    cl.setAccessible(true);
-    cl.set(tsdb, client);
-
-    Field met = tsdb.getClass().getDeclaredField("metrics");
-    met.setAccessible(true);
-    met.set(tsdb, metrics);
-
-    Field tagk = tsdb.getClass().getDeclaredField("tag_names");
-    tagk.setAccessible(true);
-    tagk.set(tsdb, tag_names);
-
-    Field tagv = tsdb.getClass().getDeclaredField("tag_values");
-    tagv.setAccessible(true);
-    tagv.set(tsdb, tag_values);
-
-    // mock UniqueId
-    when(metrics.getId("sys.cpu.user")).thenReturn(new byte[] { 0, 0, 1 });
-    when(metrics.getNameAsync(new byte[] { 0, 0, 1 }))
-      .thenReturn(Deferred.fromResult("sys.cpu.user"));
-    when(metrics.getId("sys.cpu.system"))
-      .thenThrow(new NoSuchUniqueName("sys.cpu.system", "metric"));
-    when(metrics.getId("sys.cpu.nice")).thenReturn(new byte[] { 0, 0, 2 });
-    when(metrics.getNameAsync(new byte[] { 0, 0, 2 }))
-      .thenReturn(Deferred.fromResult("sys.cpu.nice"));
-    when(tag_names.getId("host")).thenReturn(new byte[] { 0, 0, 1 });
-    when(tag_names.getIdAsync("host")).thenReturn(
-        Deferred.fromResult(new byte[] { 0, 0, 1 }));
-    when(tag_names.getNameAsync(new byte[] { 0, 0, 1 }))
-      .thenReturn(Deferred.fromResult("host"));
-    when(tag_names.getOrCreateIdAsync("host")).thenReturn(
-        Deferred.fromResult(new byte[] { 0, 0, 1 }));
-    when(tag_names.getIdAsync("dc"))
-      .thenThrow(new NoSuchUniqueName("dc", "metric"));
-    when(tag_values.getId("web01")).thenReturn(new byte[] { 0, 0, 1 });
-    when(tag_values.getIdAsync("web01")).thenReturn(
-        Deferred.fromResult(new byte[] { 0, 0, 1 }));
-    when(tag_values.getNameAsync(new byte[] { 0, 0, 1 }))
-      .thenReturn(Deferred.fromResult("web01"));
-    when(tag_values.getOrCreateIdAsync("web01")).thenReturn(
-        Deferred.fromResult(new byte[] { 0, 0, 1 }));
-    when(tag_values.getId("web02")).thenReturn(new byte[] { 0, 0, 2 });
-    when(tag_values.getIdAsync("web02")).thenReturn(
-        Deferred.fromResult(new byte[] { 0, 0, 2 }));
-    when(tag_values.getNameAsync(new byte[] { 0, 0, 2 }))
-      .thenReturn(Deferred.fromResult("web02"));
-    when(tag_values.getOrCreateIdAsync("web02")).thenReturn(
-        Deferred.fromResult(new byte[] { 0, 0, 2 }));
-    when(tag_values.getId("web03"))
-      .thenThrow(new NoSuchUniqueName("web03", "metric"));
-
-    when(metrics.width()).thenReturn((short)3);
-    when(tag_names.width()).thenReturn((short)3);
-    when(tag_values.width()).thenReturn((short)3);
   }
 
   @Test
-  public void downsample() throws Exception {
-    int downsampleInterval = (int)DateTime.parseDuration("60s");
-    query.downsample(downsampleInterval, Aggregators.SUM);
-    query.setStartTime(1356998400);
-    query.setEndTime(1357041600);
-    assertEquals(60000, TsdbQuery.ForTesting.getDownsampleIntervalMs(query));
-    long scanStartTime = 1356998400 - Const.MAX_TIMESPAN * 2 - 60;
-    assertEquals(scanStartTime, TsdbQuery.ForTesting.getScanStartTimeSeconds(query));
-    long scanEndTime = 1357041600 + Const.MAX_TIMESPAN + 1 + 60;
-    assertEquals(scanEndTime, TsdbQuery.ForTesting.getScanEndTimeSeconds(query));
+  public void downsampleFullyAligned() {
+    testDownsampleScanBounds(
+      60000L,
+      1356998400L, 1357041600L,
+
+      // The scan start time should be exactly the same as the query start time
+      // because it is aligned on both boundaries, timespan and interval.
+      1356998400L,
+
+      // However, because the query end time is already aligned on an interval,
+      // it should be snapped forward yet another interval and then snapped
+      // forward to the next timespan, which is an entire extra hour.
+      1357045200L);
+  }
+
+  @Test
+  public void downsampleUnaligned() {
+    final long fifteen_minutes = 60L * 15L;
+    final long twelve_hours = 3600L * 12L;
+    final long now = 1427415547L; // Thu Mar 26 17:19:07 2015 GMT-7:00 DST
+
+    testDownsampleScanBounds(
+      1000L * fifteen_minutes,
+      now - twelve_hours, now,
+
+      // Start time should have been snapped back to 1427415300 (5:15a) for the
+      // interval, then back to 1427371200 (5:00a) for the timespan.
+      1427371200L,
+
+      // End time should have been snapped forward to 1427416200 (5:30p) for
+      // the interval, then forward to 1427418000 (6:00p) for the timespan.
+      1427418000L);
+  }
+
+  @Test
+  public void downsampleWeirdly() {
+    final long day = 3600L * 24L;
+    final long twelve_hours = 3600L * 12L;
+
+    // Thu Mar 26 17:19:07 2015 GMT-7:00 DST
+    // Fri, 27 Mar 2015 00:19:07 GMT
+    final long now = 1427415547L;
+
+    testDownsampleScanBounds(
+      1000L * day,
+      now - twelve_hours, now,
+
+      // Start time should be midnight UTC, 26 March.
+      1427328000L,
+
+      // End time should be midnight UTC, 28 March.
+      1427500800L);
   }
 
   @Test
   public void downsampleMilliseconds() throws Exception {
-    int downsampleInterval = (int)DateTime.parseDuration("60s");
-    query.downsample(downsampleInterval, Aggregators.SUM);
-    query.setStartTime(1356998400000L);
-    query.setEndTime(1357041600000L);
-    assertEquals(60000, TsdbQuery.ForTesting.getDownsampleIntervalMs(query));
-    long scanStartTime = 1356998400 - Const.MAX_TIMESPAN * 2 - 60;
-    assertEquals(scanStartTime, TsdbQuery.ForTesting.getScanStartTimeSeconds(query));
-    long scanEndTime = 1357041600 + Const.MAX_TIMESPAN + 1 + 60;
-    assertEquals(scanEndTime, TsdbQuery.ForTesting.getScanEndTimeSeconds(query));
+    final long start_time = 1356998400000L;
+    final long end_time = 1357041600000L;
+    final long downsample_interval = DateTime.parseDuration("60s");
+
+    query.downsample(downsample_interval, Aggregators.SUM);
+    query.setStartTime(start_time);
+    query.setEndTime(end_time);
+    assertEquals(60000L, TsdbQuery.ForTesting.getDownsampleIntervalMs(query));
+
+    // The scan start time should be exactly the same as the query start time
+    // because it is aligned on both boundaries, timespan and interval.
+    assertEquals(start_time / 1000L,
+      TsdbQuery.ForTesting.getScanStartTimeSeconds(query));
+
+    // However, because the query end time is already aligned on an interval,
+    // it should be snapped forward yet another interval and then snapped
+    // forward to the next timespan, which is an entire extra hour.
+    assertEquals((end_time + 3600000L) / 1000L,
+      TsdbQuery.ForTesting.getScanEndTimeSeconds(query));
   }
 
-  @Test (expected = NullPointerException.class)
+  @Test (expected = IllegalArgumentException.class)
   public void downsampleNullAgg() throws Exception {
     query.downsample(60, null);
   }
@@ -174,344 +136,798 @@ public class TestTsdbQueryDownsample {
 
   @Test
   public void runLongSingleTSDownsample() throws Exception {
-    storeLongTimeSeriesSeconds(true, false);;
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
+    storeLongTimeSeriesSeconds(true, false);
+
     query.setStartTime(1356998400);
     query.setEndTime(1357041600);
     query.downsample(60000, Aggregators.AVG);
-    query.setTimeSeries("sys.cpu.user", tags, Aggregators.SUM, false);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, false);
     final DataPoints[] dps = query.run();
-    assertNotNull(dps);
-    assertEquals("sys.cpu.user", dps[0].metricName());
-    assertTrue(dps[0].getAggregatedTags().isEmpty());
-    assertNull(dps[0].getAnnotations());
-    assertEquals("web01", dps[0].getTags().get("host"));
+    assertMeta(dps, 0, false);
 
-    // Timeseries: (1, 2, 3, 4, ..., 299, 300) at 30-second interval timestamps.
-    // Timeseries in 60s intervals: (1, 2), (3, 4), ..., (299, 300)
-    // Integer average downsampling: 1, 3, 5, ... 297, 299
-    int i = 1;
+    // Timeseries in intervals: (1), (2, 3), (4, 5), ... (298, 299), (300)
+    int i = 0;
     for (DataPoint dp : dps[0]) {
-      assertEquals(i, dp.longValue());
-      i += 2;
-   }
-    assertEquals(150, dps[0].size());
+      // Downsampler outputs just doubles.
+      assertFalse(dp.isInteger());
+      if (i == 0) {
+        // The first time interval has just one value - (1).
+        assertEquals(1, dp.doubleValue(), 0.00001);
+      } else if (i >= 150) {
+        // The last time interval has just one value - (300).
+        assertEquals(300, dp.doubleValue(), 0.00001);
+      } else {
+        // Each interval has two consecutive numbers - (i*2, i*2+1).
+        // Takes the average of the values of this interval.
+        double value = i * 2 + 0.5;
+        assertEquals(value, dp.doubleValue(), 0.00001);
+      }
+      // Timestamp of an interval should be aligned by the interval.
+      assertEquals(0, dp.timestamp() % 60000);
+      ++i;
+    }
+    // Out of 300 values, the first and the last intervals have one value each,
+    // and the 149 intervals in the middle have two values for each.
+    assertEquals(151, dps[0].size());
   }
 
   @Test
   public void runLongSingleTSDownsampleMs() throws Exception {
     storeLongTimeSeriesMs();
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
+
     query.setStartTime(1356998400);
     query.setEndTime(1357041600);
     query.downsample(1000, Aggregators.AVG);
-    query.setTimeSeries("sys.cpu.user", tags, Aggregators.SUM, false);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, false);
     final DataPoints[] dps = query.run();
-    verify(client).newScanner(tsdb.table);
-    assertNotNull(dps);
-    assertEquals("sys.cpu.user", dps[0].metricName());
-    assertTrue(dps[0].getAggregatedTags().isEmpty());
-    assertNull(dps[0].getAnnotations());
-    assertEquals("web01", dps[0].getTags().get("host"));
+    assertMeta(dps, 0, false);
 
-    // Timeseries: (1, 2, 3, 4, ..., 299, 300) at 500-ms interval timestamps.
-    // Timeseries in 1sec intervals: (1, 2), (3, 4), ..., (299, 300) - 150 DPs
-    int i = 1;
+    // Timeseries in intervals: (1), (2, 3), (4, 5), ... (298, 299), (300)
+    int i = 0;
     for (DataPoint dp : dps[0]) {
-      assertEquals(i, dp.longValue());
-      i += 2;
+      // Downsampler outputs just doubles.
+      assertFalse(dp.isInteger());
+      if (i == 0) {
+        // The first time interval has just one value - (1).
+        assertEquals(1, dp.doubleValue(), 0.00001);
+      } else if (i >= 150) {
+        // The last time interval has just one value - (300).
+        assertEquals(300, dp.doubleValue(), 0.00001);
+      } else {
+        // Each interval has two consecutive numbers - (i*2, i*2+1).
+        // Takes the average of the values of this interval.
+        double value = i * 2 + 0.5;
+        assertEquals(value, dp.doubleValue(), 0.00001);
+      }
+      // Timestamp of an interval should be aligned by the interval.
+      assertEquals(0, dp.timestamp() % 1000);
+      ++i;
     }
-    assertEquals(150, dps[0].size());
+    // Out of 300 values, the first and the last intervals have one value each,
+    // and the 149 intervals in the middle have two values for each.
+    assertEquals(151, dps[0].size());
   }
+
   @Test
   public void runLongSingleTSDownsampleAndRate() throws Exception {
-    storeLongTimeSeriesSeconds(true, false);;
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
+    storeLongTimeSeriesSeconds(true, false);
+
     query.setStartTime(1356998400);
     query.setEndTime(1357041600);
     query.downsample(60000, Aggregators.AVG);
-    query.setTimeSeries("sys.cpu.user", tags, Aggregators.SUM, true);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, true);
     final DataPoints[] dps = query.run();
-    assertNotNull(dps);
-    assertEquals("sys.cpu.user", dps[0].metricName());
-    assertTrue(dps[0].getAggregatedTags().isEmpty());
-    assertNull(dps[0].getAnnotations());
-    assertEquals("web01", dps[0].getTags().get("host"));
+    assertMeta(dps, 0, false);
 
-    // Timeseries: (1, 2, 3, 4, ..., 299, 300) at 30-second interval timestamps.
-    // Integer average 60s downsampling: 1, 3, 5, ... 297, 299
-    // Timeseries in rate: 2 every 60 seconds or 1/30 per second
+    // Timeseries in intervals: (1), (2, 3), (4, 5), ... (298, 299), (300)
+    // After downsampling: 1, 2.5, 4.5, ... 298.5, 300
+    long expected_timestamp = 1356998460000L;
+    int i = 0;
     for (DataPoint dp : dps[0]) {
-      assertEquals(0.033F, dp.doubleValue(), 0.001);
+      assertFalse(dp.isInteger());
+      if (i == 0) {
+        // The value of the first interval is one and the next one is 2.5
+        // 0.025 = (2.5 - 1) / 60 seconds.
+        assertEquals(0.025F, dp.doubleValue(), 0.001);
+      } else if (i >= 149) {
+        // The value of the last interval is 300 and the previous one is 298.5
+        // 0.025 = (300 - 298.5) / 60 seconds.
+        assertEquals(0.025F, dp.doubleValue(), 0.00001);
+      } else {
+        // 0.033 = 2 / 60 seconds where 2 is the difference of the values
+        // of two consecutive intervals.
+        assertEquals(0.033F, dp.doubleValue(), 0.001);
+      }
+      // Timestamp of an interval should be aligned by the interval.
+      assertEquals(0, dp.timestamp() % 60000);
+      assertEquals(expected_timestamp, dp.timestamp());
+      expected_timestamp += 60000;
+      ++i;
     }
-    assertEquals(149, dps[0].size());
+    assertEquals(150, dps[0].size());
   }
 
   @Test
   public void runLongSingleTSDownsampleAndRateMs() throws Exception {
     storeLongTimeSeriesMs();
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
+
     query.setStartTime(1356998400);
     query.setEndTime(1357041600);
     query.downsample(1000, Aggregators.AVG);
-    query.setTimeSeries("sys.cpu.user", tags, Aggregators.SUM, true);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, true);
     final DataPoints[] dps = query.run();
-    assertNotNull(dps);
-    assertEquals("sys.cpu.user", dps[0].metricName());
-    assertTrue(dps[0].getAggregatedTags().isEmpty());
-    assertNull(dps[0].getAnnotations());
-    assertEquals("web01", dps[0].getTags().get("host"));
+    assertMeta(dps, 0, false);
 
-    // Timeseries: (1, 2, 3, 4, ..., 299, 300) at 500-ms interval timestamps.
-    // Integer average 1 sec downsampling: 1, 3, 5, ... 297, 299
+    // Timeseries in intervals: (1), (2, 3), (4, 5), ... (298, 299), (300)
+    // After downsampling: 1, 2.5, 4.5, ... 298.5, 300
+    int i = 0;
     for (DataPoint dp : dps[0]) {
-      assertEquals(2.0F, dp.doubleValue(), 0.001);
+      assertFalse(dp.isInteger());
+      if (i == 0) {
+        // The value of the first interval is one and the next one is 2.5
+        // 1.5 = (2.5 - 1) / 1.000 seconds.
+        assertEquals(1.5F, dp.doubleValue(), 0.001);
+      } else if (i >= 149) {
+        // The value of the last interval is 300 and the previous one is 298.5
+        // 1.5 = (300 - 298.5) / 1.000 seconds.
+        assertEquals(1.5, dp.doubleValue(), 0.00001);
+      } else {
+        // 2 = 2 / 1.000 seconds where 2 is the difference of the values
+        // of two consecutive intervals.
+        assertEquals(2F, dp.doubleValue(), 0.001);
+      }
+      // Timestamp of an interval should be aligned by the interval.
+      assertEquals(0, dp.timestamp() % 1000);
+      ++i;
     }
-    assertEquals(149, dps[0].size());
+    assertEquals(150, dps[0].size());
   }
 
   @Test
   public void runFloatSingleTSDownsample() throws Exception {
     storeFloatTimeSeriesSeconds(true, false);
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
+
     query.setStartTime(1356998400);
     query.setEndTime(1357041600);
     query.downsample(60000, Aggregators.AVG);
-    query.setTimeSeries("sys.cpu.user", tags, Aggregators.SUM, false);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, false);
     final DataPoints[] dps = query.run();
-    assertNotNull(dps);
-    assertEquals("sys.cpu.user", dps[0].metricName());
-    assertTrue(dps[0].getAggregatedTags().isEmpty());
-    assertNull(dps[0].getAnnotations());
-    assertEquals("web01", dps[0].getTags().get("host"));
+    assertMeta(dps, 0, false);
 
-    // Timeseries in 30s intervals: (1.25, 1.5, 1.75, 2, 2.25, ..., 75.75, 76).
-    // Float average 60s downsampling: 2.75/2, 3.75/2, ... 151.75/2
-    double i = 1.375D;
+    // Timeseries in intervals: (1.25), (1.5, 1.75), (2, 2.25), ...
+    // (75.5, 75.75), (76).
+    // After downsampling: 1.25, 1.625, 2.125, ... 75.625, 76
+    int i = 0;
     for (DataPoint dp : dps[0]) {
-      assertEquals(i, dp.doubleValue(), 0.00001);
-      i += 0.5D;
+      if (i == 0) {
+        // The first time interval has just one value - 1.25.
+        assertEquals(1.25, dp.doubleValue(), 0.00001);
+      } else if (i >= 150) {
+        // The last time interval has just one value - 76.
+        assertEquals(76D, dp.doubleValue(), 0.00001);
+      } else {
+        // Each interval has two consecutive numbers - (i*0.5+1, i*0.5+1.25).
+        // Takes the average of the values of this interval.
+        double value = (i + 2.25) / 2;
+        assertEquals(value, dp.doubleValue(), 0.00001);
+      }
+      // Timestamp of an interval should be aligned by the interval.
+      assertEquals(0, dp.timestamp() % 60000);
+      ++i;
     }
-    assertEquals(150, dps[0].size());
+    // Out of 300 values, the first and the last intervals have one value each,
+    // and the 149 intervals in the middle have two values for each.
+    assertEquals(151, dps[0].size());
   }
 
   @Test
   public void runFloatSingleTSDownsampleMs() throws Exception {
     storeFloatTimeSeriesMs();
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
+
     query.setStartTime(1356998400);
     query.setEndTime(1357041600);
     query.downsample(1000, Aggregators.AVG);
-    query.setTimeSeries("sys.cpu.user", tags, Aggregators.SUM, false);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, false);
     final DataPoints[] dps = query.run();
-    assertNotNull(dps);
-    assertEquals("sys.cpu.user", dps[0].metricName());
-    assertTrue(dps[0].getAggregatedTags().isEmpty());
-    assertNull(dps[0].getAnnotations());
-    assertEquals("web01", dps[0].getTags().get("host"));
+    assertMeta(dps, 0, false);
 
-    // Timeseries in 500ms intervals: (1.25, 1.5, 1.75, 2, ..., 75.75, 76).
-    // Float average 1s downsampling: 2.75/2, 3.75/2, ... 151.75/2
-    double i = 1.375D;
+    // Timeseries in intervals: (1.25), (1.5, 1.75), (2, 2.25), ...
+    // (75.5, 75.75), (76).
+    // After downsampling: 1.25, 1.625, 2.125, ... 75.625, 76
+    int i = 0;
     for (DataPoint dp : dps[0]) {
-      assertEquals(i, dp.doubleValue(), 0.00001);
-      i += 0.5D;
+      if (i == 0) {
+        // The first time interval has just one value.
+        assertEquals(1.25, dp.doubleValue(), 0.00001);
+      } else if (i >= 150) {
+        // The last time interval has just one value.
+        assertEquals(76D, dp.doubleValue(), 0.00001);
+      } else {
+        // Each interval has two consecutive numbers - (i*0.5+1, i*0.5+1.25).
+        // Takes the average of the values of this interval.
+        double value = (i + 2.25) / 2;
+        assertEquals(value, dp.doubleValue(), 0.00001);
+      }
+      // Timestamp of an interval should be aligned by the interval.
+      assertEquals(0, dp.timestamp() % 1000);
+      ++i;
     }
-    assertEquals(150, dps[0].size());
+    // Out of 300 values, the first and the last intervals have one value each,
+    // and the 149 intervals in the middle have two values for each.
+    assertEquals(151, dps[0].size());
   }
 
   @Test
   public void runFloatSingleTSDownsampleAndRate() throws Exception {
     storeFloatTimeSeriesSeconds(true, false);
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
+
     query.setStartTime(1356998400);
     query.setEndTime(1357041600);
     query.downsample(60000, Aggregators.AVG);
-    query.setTimeSeries("sys.cpu.user", tags, Aggregators.SUM, true);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, true);
     final DataPoints[] dps = query.run();
-    assertNotNull(dps);
-    assertEquals("sys.cpu.user", dps[0].metricName());
-    assertTrue(dps[0].getAggregatedTags().isEmpty());
-    assertNull(dps[0].getAnnotations());
-    assertEquals("web01", dps[0].getTags().get("host"));
+    assertMeta(dps, 0, false);
 
-    // Timeseries in 30s intervals: (1.25, 1.5, 1.75, 2, 2.25, ..., 75.75, 76).
-    // Float average 60s downsampling: 2.75/2, 3.75/2, ... 151.75/2
-    // Rate = (3.75/2 - 2.75/2) / 60 = 1 / 120.
+    // Timeseries in intervals: (1.25), (1.5, 1.75), (2, 2.25), ...
+    // (75.5, 75.75), (76).
+    // After downsampling: 1.25, 1.625, 2.125, ... 75.625, 76
+    long expected_timestamp = 1356998460000L;
+    int i = 0;
     for (DataPoint dp : dps[0]) {
-      assertEquals(0.00833F, dp.doubleValue(), 0.00001);
+      assertFalse(dp.isInteger());
+      if (i == 0) {
+        // The value of the first interval is 1.25 and the next one is 1.625
+        // 0.00625 = (1.625 - 1.25) / 60 seconds.
+        assertEquals(0.00625F, dp.doubleValue(), 0.000001);
+      } else if (i >= 149) {
+        // The value of the last interval is 76 and the previous one is 75.625
+        // 0.00625 = (76 - 75.625) / 60 seconds.
+        assertEquals(0.00625F, dp.doubleValue(), 0.000001);
+      } else {
+        // 0.00833 = 0.5 / 60 seconds where 0.5 is the difference of the values
+        // of two consecutive intervals.
+        assertEquals(0.00833F, dp.doubleValue(), 0.00001);
+      }
+      // Timestamp of an interval should be aligned by the interval.
+      assertEquals(0, dp.timestamp() % 60000);
+      assertEquals(expected_timestamp, dp.timestamp());
+      expected_timestamp += 60000;
+      ++i;
     }
-    assertEquals(149, dps[0].size());
+    assertEquals(150, dps[0].size());
   }
 
   @Test
   public void runFloatSingleTSDownsampleAndRateMs() throws Exception {
     storeFloatTimeSeriesMs();
+
+    query.setStartTime(1356998400);
+    query.setEndTime(1357041600);
+    query.downsample(1000, Aggregators.AVG);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, true);
+    final DataPoints[] dps = query.run();
+    assertMeta(dps, 0, false);
+
+    // Timeseries in intervals: (1.25), (1.5, 1.75), (2, 2.25), ...
+    // (75.5, 75.75), (76).
+    // After downsampling: 1.25, 1.625, 2.125, ... 75.625, 76
+    int i = 0;
+    for (DataPoint dp : dps[0]) {
+      if (i == 0) {
+        // The value of the first interval is 1.25 and the next one is 1.625
+        // 0.375 = (1.625 - 1.25) / 1.000 seconds.
+        assertEquals(0.375F, dp.doubleValue(), 0.000001);
+      } else if (i >= 149) {
+        // The value of the last interval is 76 and the previous one is 75.625
+        // 0.375 = (76 - 75.625) / 1.000 seconds.
+        assertEquals(0.375F, dp.doubleValue(), 0.000001);
+      } else {
+        // 0.5 = 0.5 / 1.000 seconds where 0.5 is the difference of the values
+        // of two consecutive intervals.
+        assertEquals(0.5F, dp.doubleValue(), 0.00001);
+      }
+      // Timestamp of an interval should be aligned by the interval.
+      assertEquals(0, dp.timestamp() % 1000);
+      ++i;
+    }
+    assertEquals(150, dps[0].size());
+  }
+
+  @Test
+  public void runLongSingleTSDownsampleCount() throws Exception {
+    storeLongTimeSeriesSeconds(true, false);
+
+    query.setStartTime(1356998400);
+    query.setEndTime(1357041600);
+    query.downsample(60000, Aggregators.COUNT);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, false);
+    final DataPoints[] dps = query.run();
+    assertMeta(dps, 0, false);
+
+    // Timeseries in intervals: (1), (2, 3), (4, 5), ... (298, 299), (300)
+    int i = 0;
+    for (DataPoint dp : dps[0]) {
+      // Downsampler outputs just doubles.
+      assertFalse(dp.isInteger());
+      if (i == 0 || i == 150) {
+        assertEquals(1, dp.doubleValue(), 0.00001);
+      } else {
+        assertEquals(2, dp.doubleValue(), 0.00001);
+      }
+      ++i;
+    }
+    // Out of 300 values, the first and the last intervals have one value each,
+    // and the 149 intervals in the middle have two values for each.
+    assertEquals(151, dps[0].size());
+  }
+  
+  @Test
+  public void runLongSingleTSDownsampleAll() throws Exception {
+    storeLongTimeSeriesSeconds(true, false);
+    final TSQuery ts_query = new TSQuery();
+    ts_query.setStart("1356998400");
+    ts_query.setEnd("1357041600");
+    
+    final HashMap<String, String> tags = new HashMap<String, String>(1);
+    tags.put("host", "web01");
+    final TSSubQuery sub = new TSSubQuery();
+    sub.setTags(tags);
+    sub.setMetric("sys.cpu.user");
+    sub.setAggregator("sum");
+    sub.setDownsample("0all-sum");
+    
+    ts_query.setQueries(Lists.newArrayList(sub));
+    ts_query.validateAndSetQuery();
+    query.configureFromQuery(ts_query, 0);
+    
+    final DataPoints[] dps = query.run();
+    assertMeta(dps, 0, false);
+
+    for (DataPoint dp : dps[0]) {
+      // Downsampler outputs just doubles.
+      assertFalse(dp.isInteger());
+      assertEquals(45150, dp.doubleValue(), 0.00001);
+      assertEquals(1356998400000L, dp.timestamp());
+    }
+    // Out of 300 values, the first and the last intervals have one value each,
+    // and the 149 intervals in the middle have two values for each.
+    assertEquals(1, dps[0].size());
+  }
+  
+  @Test
+  public void runLongSingleTSDownsampleAllSubSet() throws Exception {
+    storeLongTimeSeriesSeconds(true, false);
+    final TSQuery ts_query = new TSQuery();
+    ts_query.setStart("1356998500");
+    ts_query.setEnd("1356998600");
+    
+    final HashMap<String, String> tags = new HashMap<String, String>(1);
+    tags.put("host", "web01");
+    final TSSubQuery sub = new TSSubQuery();
+    sub.setTags(tags);
+    sub.setMetric("sys.cpu.user");
+    sub.setAggregator("sum");
+    sub.setDownsample("0all-sum");
+    
+    ts_query.setQueries(Lists.newArrayList(sub));
+    ts_query.validateAndSetQuery();
+    query.configureFromQuery(ts_query, 0);
+    
+    final DataPoints[] dps = query.run();
+    assertMeta(dps, 0, false);
+
+    for (DataPoint dp : dps[0]) {
+      // Downsampler outputs just doubles.
+      assertFalse(dp.isInteger());
+      assertEquals(15, dp.doubleValue(), 0.00001);
+      assertEquals(1356998500000L, dp.timestamp());
+    }
+    // Out of 300 values, the first and the last intervals have one value each,
+    // and the 149 intervals in the middle have two values for each.
+    assertEquals(1, dps[0].size());
+  }
+  
+  @Test
+  public void runLongSingleTSDownsampleAllNoEnd() throws Exception {
+    storeLongTimeSeriesSeconds(true, false);
+    final TSQuery ts_query = new TSQuery();
+    ts_query.setStart("1356998400");
+    
+    final HashMap<String, String> tags = new HashMap<String, String>(1);
+    tags.put("host", "web01");
+    final TSSubQuery sub = new TSSubQuery();
+    sub.setTags(tags);
+    sub.setMetric("sys.cpu.user");
+    sub.setAggregator("sum");
+    sub.setDownsample("0all-sum");
+    
+    ts_query.setQueries(Lists.newArrayList(sub));
+    ts_query.validateAndSetQuery();
+    query.configureFromQuery(ts_query, 0);
+    
+    final DataPoints[] dps = query.run();
+    assertMeta(dps, 0, false);
+
+    for (DataPoint dp : dps[0]) {
+      // Downsampler outputs just doubles.
+      assertFalse(dp.isInteger());
+      assertEquals(45150, dp.doubleValue(), 0.00001);
+      assertEquals(1356998400000L, dp.timestamp());
+    }
+    // Out of 300 values, the first and the last intervals have one value each,
+    // and the 149 intervals in the middle have two values for each.
+    assertEquals(1, dps[0].size());
+  }
+  
+  // this could happen.
+  @Test
+  public void runFloatSingleTSDownsampleAndRateAndCount() throws Exception {
+    storeFloatTimeSeriesSeconds(true, false);
+
+    query.setStartTime(1356998400);
+    query.setEndTime(1357041600);
+    query.downsample(60000, Aggregators.COUNT);
+    query.setTimeSeries(METRIC_STRING, tags, Aggregators.SUM, true);
+    final DataPoints[] dps = query.run();
+    assertMeta(dps, 0, false);
+
+    // Timeseries in intervals: (1.25), (1.5, 1.75), (2, 2.25), ...
+    // (75.5, 75.75), (76).
+    // After downsampling: 1.25, 1.625, 2.125, ... 75.625, 76
+    long expected_timestamp = 1356998460000L;
+    int i = 0;
+    for (DataPoint dp : dps[0]) {
+      assertFalse(dp.isInteger());
+      if (i == 0) {
+        // switching from 1 value to 2 on the first point
+        assertEquals(0.016666F, dp.doubleValue(), 0.00001);
+      } else if (i == 149) {
+        // switching from 2 values to 1 on the last point
+        assertEquals(-0.016666F, dp.doubleValue(), 0.00001);
+      } else {
+        // no difference between the value counts for most of these so zero
+        assertEquals(0.000F, dp.doubleValue(), 0.00001);
+      }
+      // Timestamp of an interval should be aligned by the interval.
+      assertEquals(0, dp.timestamp() % 60000);
+      assertEquals(expected_timestamp, dp.timestamp());
+      expected_timestamp += 60000;
+      ++i;
+    }
+    assertEquals(150, dps[0].size());
+  }
+
+  @Test (expected = IllegalArgumentException.class)
+  public void runLongSingleTSDownsampleNone() throws Exception {
+    storeLongTimeSeriesSeconds(true, false);
     HashMap<String, String> tags = new HashMap<String, String>(1);
     tags.put("host", "web01");
     query.setStartTime(1356998400);
     query.setEndTime(1357041600);
-    query.downsample(1000, Aggregators.AVG);
-    query.setTimeSeries("sys.cpu.user", tags, Aggregators.SUM, true);
+    query.downsample(60000, Aggregators.NONE);
+    query.setTimeSeries("sys.cpu.user", tags, Aggregators.SUM, false);
+  }
+  
+  @Test (expected = RuntimeException.class)
+  public void runLongSingleTSDownsampleNoneSnuckIn() throws Exception {
+    storeLongTimeSeriesSeconds(true, false);
+    final TSQuery ts_query = new TSQuery();
+    ts_query.setStart("1356998400");
+    ts_query.setEnd("1357041600");
+    
+    final HashMap<String, String> tags = new HashMap<String, String>(1);
+    tags.put("host", "web01");
+    final TSSubQuery sub = new TSSubQuery();
+    sub.setTags(tags);
+    sub.setMetric("sys.cpu.user");
+    sub.setAggregator("sum");
+    sub.setDownsample("1m-sum");
+    
+    ts_query.setQueries(Lists.newArrayList(sub));
+    ts_query.validateAndSetQuery();
+    query.configureFromQuery(ts_query, 0);
+    Whitebox.setInternalState(query, "downsampler", Aggregators.NONE);
+    
     final DataPoints[] dps = query.run();
-    assertNotNull(dps);
-    assertEquals("sys.cpu.user", dps[0].metricName());
-    assertTrue(dps[0].getAggregatedTags().isEmpty());
-    assertNull(dps[0].getAnnotations());
-    assertEquals("web01", dps[0].getTags().get("host"));
-
-    // Timeseries in 500ms intervals: (1.25, 1.5, 1.75, 2, ..., 75.75, 76).
-    // Float average 1s downsampling: 2.75/2, 3.75/2, ... 151.75/2
     for (DataPoint dp : dps[0]) {
-      assertEquals(0.5F, dp.doubleValue(), 0.00001);
+      dp.timestamp();
     }
-    assertEquals(149, dps[0].size());
+  }
+  
+  /**
+   * A helper interface to be used by the filling-test code. 
+   */ 
+  interface Validator {
+    /** @return true if the argument is valid. */
+    boolean isValidValue(double value);
+
+    /** @return the fill policy to be used while downsampling. */
+    FillPolicy getFillPolicy();
+
+    /** @return true if the argument is the sentinel for empty intervals. */
+    boolean isMissingValue(double value);
   }
 
-  // ----------------- //
-  // Helper functions. //
-  // ----------------- //
-
-  private void storeLongTimeSeriesSeconds(final boolean two_metrics,
-      final boolean offset) throws Exception {
-    storeLongTimeSeriesSecondsWithBasetime(1356998400L, two_metrics, offset);
-  }
-
-  private void storeLongTimeSeriesSecondsWithBasetime(final long baseTimestamp,
-      final boolean two_metrics, final boolean offset) throws Exception {
-    setQueryStorage();
-    // dump a bunch of rows of two metrics so that we can test filtering out
-    // on the metric
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
-    long timestamp = baseTimestamp;
-    for (int i = 1; i <= 300; i++) {
-      tsdb.addPoint("sys.cpu.user", timestamp += 30, i, tags).joinUninterruptibly();
-      if (two_metrics) {
-        tsdb.addPoint("sys.cpu.nice", timestamp, i, tags).joinUninterruptibly();
-      }
+  // Fill missing intervals with NaNs.
+  abstract class NaNValidator implements Validator {
+    @Override
+    public FillPolicy getFillPolicy() {
+      return FillPolicy.NOT_A_NUMBER;
     }
 
-    // dump a parallel set but invert the values
-    tags.clear();
-    tags.put("host", "web02");
-    timestamp = baseTimestamp + (offset ? 15 : 0);
-    for (int i = 300; i > 0; i--) {
-      tsdb.addPoint("sys.cpu.user", timestamp += 30, i, tags).joinUninterruptibly();
-      if (two_metrics) {
-        tsdb.addPoint("sys.cpu.nice", timestamp, i, tags).joinUninterruptibly();
-      }
+    @Override
+    public boolean isMissingValue(final double value) {
+      return Double.isNaN(value);
     }
   }
 
-  private void storeLongTimeSeriesMs() throws Exception {
-    setQueryStorage();
-    // dump a bunch of rows of two metrics so that we can test filtering out
-    // on the metric
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
-    long timestamp = 1356998400000L;
-    for (int i = 1; i <= 300; i++) {
-      tsdb.addPoint("sys.cpu.user", timestamp += 500, i, tags).joinUninterruptibly();
-      tsdb.addPoint("sys.cpu.nice", timestamp, i, tags).joinUninterruptibly();
+  // Fill missing intervals with zeroes.
+  abstract class ZeroValidator implements Validator {
+    @Override
+    public FillPolicy getFillPolicy() {
+      return FillPolicy.ZERO;
     }
 
-    // dump a parallel set but invert the values
-    tags.clear();
-    tags.put("host", "web02");
-    timestamp = 1356998400000L;
-    for (int i = 300; i > 0; i--) {
-      tsdb.addPoint("sys.cpu.user", timestamp += 500, i, tags).joinUninterruptibly();
-      tsdb.addPoint("sys.cpu.nice", timestamp, i, tags).joinUninterruptibly();
+    @Override
+    public boolean isMissingValue(final double value) {
+      return DoubleMath.fuzzyEquals(0.0, value, 0.0001);
     }
   }
 
-  private void storeFloatTimeSeriesSeconds(final boolean two_metrics,
-      final boolean offset) throws Exception {
-    setQueryStorage();
-    // dump a bunch of rows of two metrics so that we can test filtering out
-    // on the metric
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
-    long timestamp = 1356998400;
-    for (float i = 1.25F; i <= 76; i += 0.25F) {
-      tsdb.addPoint("sys.cpu.user", timestamp += 30, i, tags).joinUninterruptibly();
-      if (two_metrics) {
-        tsdb.addPoint("sys.cpu.nice", timestamp, i, tags).joinUninterruptibly();
-      }
-    }
+  @Test
+  public void runSumAvgLongSingleTSDownsampleWNulls() throws Exception {
+    storeLongTimeSeriesWithMissingData();
 
-    // dump a parallel set but invert the values
-    tags.clear();
-    tags.put("host", "web02");
-    timestamp = offset ? 1356998415 : 1356998400;
-    for (float i = 75F; i > 0; i -= 0.25F) {
-      tsdb.addPoint("sys.cpu.user", timestamp += 30, i, tags).joinUninterruptibly();
-      if (two_metrics) {
-        tsdb.addPoint("sys.cpu.nice", timestamp, i, tags).joinUninterruptibly();
-      }
-    }
+    runTSDownsampleWithMissingData(Aggregators.SUM, Aggregators.AVG,
+      // 301.5, 301.5, 301.5, ...
+      new NaNValidator() {
+        @Override
+        public boolean isValidValue(final double value) {
+          return DoubleMath.fuzzyEquals(301.5, value, 0.0001);
+        }
+      });
   }
 
-  private void storeFloatTimeSeriesMs() throws Exception {
-    setQueryStorage();
-    // dump a bunch of rows of two metrics so that we can test filtering out
-    // on the metric
-    HashMap<String, String> tags = new HashMap<String, String>(1);
-    tags.put("host", "web01");
-    long timestamp = 1356998400000L;
-    for (float i = 1.25F; i <= 76; i += 0.25F) {
-      tsdb.addPoint("sys.cpu.user", timestamp += 500, i, tags).joinUninterruptibly();
-      tsdb.addPoint("sys.cpu.nice", timestamp, i, tags).joinUninterruptibly();
-    }
+  @Test
+  public void runAvgSumLongSingleTSDownsampleWNulls() throws Exception {
+    storeLongTimeSeriesWithMissingData();
 
-    // dump a parallel set but invert the values
-    tags.clear();
-    tags.put("host", "web02");
-    timestamp = 1356998400000L;
-    for (float i = 75F; i > 0; i -= 0.25F) {
-      tsdb.addPoint("sys.cpu.user", timestamp += 500, i, tags).joinUninterruptibly();
-      tsdb.addPoint("sys.cpu.nice", timestamp, i, tags).joinUninterruptibly();
-    }
-  }
+    runTSDownsampleWithMissingData(Aggregators.AVG, Aggregators.SUM,
+      // 152, 301.5, 155, 301.5, 158, 301.5, ...
+      new NaNValidator() {
+        private boolean even = false;
+        private double even_expected = 149.0;
 
-  @SuppressWarnings("unchecked")
-  private void setQueryStorage() throws Exception {
-    storage = new MockBase(tsdb, client, true, true, true, true);
-    storage.setFamily("t".getBytes(MockBase.ASCII()));
-
-    PowerMockito.mockStatic(IncomingDataPoints.class);
-    PowerMockito.doAnswer(
-        new Answer<byte[]>() {
-          public byte[] answer(final InvocationOnMock args)
-            throws Exception {
-            final String metric = (String)args.getArguments()[1];
-            final Map<String, String> tags =
-              (Map<String, String>)args.getArguments()[2];
-
-            if (metric.equals("sys.cpu.user")) {
-              if (tags.get("host").equals("web01")) {
-                return new byte[] { 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1};
-              } else {
-                return new byte[] { 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 2};
-              }
-            } else {
-              if (tags.get("host").equals("web01")) {
-                return new byte[] { 0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1};
-              } else {
-                return new byte[] { 0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 0, 0, 2};
-              }
-            }
+        @Override
+        public boolean isValidValue(final double value) {
+          even = !even;
+          if (even) {
+            even_expected += 3.0;
+            return DoubleMath.fuzzyEquals(even_expected, value, 0.0001);
+          } else {
+            return DoubleMath.fuzzyEquals(301.5, value, 0.0001);
           }
         }
-    ).when(IncomingDataPoints.class, "rowKeyTemplate", (TSDB)any(), anyString(),
-        (Map<String, String>)any());
+      });
+  }
+
+  @Test
+  public void runAvgAvgLongSingleTSDownsampleWNulls() throws Exception {
+    storeLongTimeSeriesWithMissingData();
+
+    runTSDownsampleWithMissingData(Aggregators.AVG, Aggregators.AVG,
+      // 150.75, 150.75, 150.75, ...
+      new ZeroValidator() {
+        @Override
+        public boolean isValidValue(final double value) {
+          return DoubleMath.fuzzyEquals(150.75, value, 0.0001);
+        }
+      });
+  }
+
+  @Test
+  public void runSumSumLongSingleTSDownsampleWNulls() throws Exception {
+    storeLongTimeSeriesWithMissingData();
+
+    runTSDownsampleWithMissingData(Aggregators.SUM, Aggregators.SUM,
+      // 304, 603, 310, 603, 316, 603, ...
+      new NaNValidator() {
+        private double even_expected = 298.0;
+        private final double odd_expected = 603.0;
+        private boolean even = false;
+
+        @Override
+        public boolean isValidValue(final double value) {
+          even = !even;
+          if (even) {
+            even_expected += 6.0;
+            return DoubleMath.fuzzyEquals(even_expected, value, 0.0001);
+          } else {
+            return DoubleMath.fuzzyEquals(odd_expected, value, 0.0001);
+          }
+        }
+      });
+  }
+
+  @Test
+  public void runMinMinLongSingleTSDownsampleWNulls() throws Exception {
+    storeLongTimeSeriesWithMissingData();
+
+    runTSDownsampleWithMissingData(Aggregators.MIN, Aggregators.MIN,
+      // 2, 5, 8, ..., 143, 146, 149, 149, 145, 143, 139, 133, 131, ...
+      new ZeroValidator() {
+        private double even_expected = -4.0;
+        private double even_change = 6.0;
+        private double odd_expected = -1.0;
+        private double odd_change = 6.0;
+        private boolean even = false;
+
+        @Override
+        public boolean isValidValue(final double value) {
+          even = !even;
+          if (even) {
+            even_expected += even_change;
+
+            // Check for the point at which even terms change.
+            if (DoubleMath.fuzzyEquals(even_expected, 152.0, 0.0001)) {
+              // After this point, even terms begin decreasing by six.
+              even_expected = 149.0;
+              even_change = -6.0;
+            }
+
+            return DoubleMath.fuzzyEquals(even_expected, value, 0.0001);
+          } else {
+            odd_expected += odd_change;
+
+            // Check for the point at which odd terms change.
+            if (DoubleMath.fuzzyEquals(odd_expected, 155.0, 0.0001)) {
+              // After this point, odd terms begin decreasing by six.
+              odd_expected = 145.0;
+              odd_change = -6.0;
+            }
+
+            return DoubleMath.fuzzyEquals(odd_expected, value, 0.0001);
+          }
+        }
+      });
+  }
+
+  @Test
+  public void runMinSumLongSingleTSDownsampleWNulls() throws Exception {
+    storeLongTimeSeriesWithMissingData();
+
+    runTSDownsampleWithMissingData(Aggregators.MIN, Aggregators.SUM,
+      // 5, 11, 17, 23, ..., 197, 203, 197, 215, 191, 227, 185, 239, ...,
+      // 287, 155, 299, 149, 292, 143, 280, ...
+      new NaNValidator() {
+        private double even_expected = -7.0;
+        private double even_change = 12.0;
+        private double odd_expected = -1.0;
+        private double odd_change = 12.0;
+        private boolean even = false;
+
+        @Override
+        public boolean isValidValue(final double value) {
+          even = !even;
+          if (even) {
+            even_expected += even_change;
+
+            // Check for the point at which even terms change.
+            if (DoubleMath.fuzzyEquals(even_expected, 209.0, 0.0001)) {
+              // After this point, even terms begin decreasing by six.
+              even_expected = 197.0;
+              even_change = -6.0;
+            }
+
+            return DoubleMath.fuzzyEquals(even_expected, value, 0.0001);
+          } else {
+            odd_expected += odd_change;
+
+            // Check for the point at which odd terms change.
+            if (DoubleMath.fuzzyEquals(odd_expected, 311.0, 0.0001)) {
+              // After this point, odd terms begin decreasing by twelve.
+              odd_expected = 292.0;
+              odd_change = -12.0;
+            }
+
+            return DoubleMath.fuzzyEquals(odd_expected, value, 0.0001);
+          }
+        }
+      });
+  }
+
+  @Test
+  public void runSumMinLongSingleTSDownsampleWNulls() throws Exception {
+    storeLongTimeSeriesWithMissingData();
+
+    runTSDownsampleWithMissingData(Aggregators.SUM, Aggregators.MIN,
+      // 301, 300, 301, 300, ...
+      new NaNValidator() {
+        private boolean even = false;
+
+        @Override
+        public boolean isValidValue(final double value) {
+          even = !even;
+          return DoubleMath.fuzzyEquals(
+            even ? 301.0 : 300.0, value, 0.0001);
+        }
+      });
+  }
+
+  /**
+   * Precondition: the time series have been stored.
+   */
+  public void runTSDownsampleWithMissingData(final Aggregator queryAggregator,
+      final Aggregator downsampleAggregator, final Validator validator)
+      throws Exception {
+    final long start_time = 1356998400L;
+    final long end_time = 1357041600L;
+    final int ds_interval = 30;
+    final long ds_interval_ms = 1000L * ds_interval;
+    final String metric = METRIC_STRING;
+
+    final HashMap<String, String> tags = new HashMap<String, String>(0);
+    query.setStartTime(start_time);
+    query.setEndTime(end_time);
+    query.downsample(ds_interval_ms, downsampleAggregator,
+      validator.getFillPolicy());
+    query.setTimeSeries(metric, tags, queryAggregator, false);
+    final DataPoints[] dps = query.run();
+
+    assertNotNull(dps);
+    assertEquals(metric, dps[0].metricName());
+    assertFalse(dps[0].getAggregatedTags().isEmpty());
+    assertNull(dps[0].getAnnotations());
+
+    // For the reasoning behind this calculation, see the following methods:
+    //   TsdbQuery#getScanStartTimeSeconds()
+    //   TsdbQuery#getScanEndTimeSeconds()
+
+    int i = 0;
+    long expected_timestamp_ms = 1000L * start_time;
+    for (final DataPoint dp : dps[0]) {
+      // Downsampler outputs just doubles.
+      assertFalse(dp.isInteger());
+
+      // There should be only one hundred valid values.
+      if (i++ < 100) {
+        // Check the value.
+        assertTrue(validator.isValidValue(dp.doubleValue()));
+      } else {
+        // Otherwise, the value should be the special missing value.
+        assertTrue(validator.isMissingValue(dp.doubleValue()));
+      }
+
+      // The timestamp should match our expectation based on the interval.
+      assertEquals(expected_timestamp_ms, dp.timestamp());
+
+      // Move to the next expected interval.
+      expected_timestamp_ms += ds_interval_ms;
+    }
+
+    // Ensure we got the number of points we expected.
+    assertEquals((end_time - start_time + 3600L) / ds_interval, dps[0].size());
+  }
+
+  /**
+   * Helper to test the start and stop times in a query for downsampling
+   * @param downsample_interval The downsample interval
+   * @param start_time The start of the query
+   * @param end_time The end of the query
+   * @param expected_start_time What we expect the TSDBQuery class to give us
+   * @param expected_end_time What we expect the TSDBQuery class to give us
+   */
+  private void testDownsampleScanBounds(final long downsample_interval,
+      final long start_time, final long end_time,
+      final long expected_start_time, final long expected_end_time) {
+    query.downsample(downsample_interval, Aggregators.SUM);
+    query.setStartTime(start_time);
+    query.setEndTime(end_time);
+
+    assertEquals(expected_start_time,
+      TsdbQuery.ForTesting.getScanStartTimeSeconds(query));
+
+    assertEquals(expected_end_time,
+      TsdbQuery.ForTesting.getScanEndTimeSeconds(query));
   }
 }

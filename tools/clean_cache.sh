@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 CACHE_DIR=/tmp/tsd
 
@@ -8,5 +8,5 @@ diskSpaceIsShort() {
 }
 
 if diskSpaceIsShort; then
-  rm -rf "$CACHE_DIR"/*
+  ( cd ${CACHE_DIR} && find . -type f -exec rm {} \; )
 fi

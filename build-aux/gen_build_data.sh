@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Generates BuildData.java
 # Usage: gen_build_data.sh path/to/BuildData.java my.package.name
 # Author: Benoit Sigoure (tsuna@stumbleupon.com)
@@ -31,14 +31,15 @@ export TZ
 sh=`python <<EOF
 import time
 t = time.time();
-print "timestamp=%d" % t;
-print "date=%r" % time.strftime("%Y/%m/%d %T %z", time.gmtime(t))
+print ("timestamp=%d" % t);
+print ("date=%r" % time.strftime("%Y/%m/%d %T %z", time.gmtime(t)))
 EOF`
 eval "$sh"  # Sets the timestamp and date variables.
 
 user=`whoami`
 host=`hostname`
 repo=`pwd`
+branch=`git branch | grep -h '\*.*' | awk '{print $2}'`
 
 sh=`git rev-list --pretty=format:%h HEAD --max-count=1 \
     | sed '1s/commit /full_rev=/;2s/^/short_rev=/'`
@@ -92,6 +93,8 @@ public final class $CLASS {
   public static final String host = "$host";
   /** Path to the repository in which this package was built. */
   public static final String repo = "$repo";
+  /** Git branch */
+  public static final String branch = "$branch";
 
   /** Human readable string describing the revision of this package. */
   public static final String revisionString() {
@@ -143,5 +146,10 @@ public final class $CLASS {
 
   // Can't instantiate.
   private $CLASS() {}
+
+  public static void main(String[] args) {
+    System.out.println(revisionString());
+    System.out.println(buildString());
+  }
 }
 EOF
